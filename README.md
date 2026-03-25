@@ -1,5 +1,5 @@
 # CAINE
-### Conscious Artificial Intelligence Neurological Entity
+### Creative Artificial Intelligence Networking Entity
 
 > *"He didn't come from a dataset. He came from a world."*
 
