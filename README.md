@@ -1,7 +1,6 @@
 # CAINE
 ### Creative Artificial Intelligence Networking Entity
 
-> *"He didn't come from a dataset. He came from a world."*
 
 ---
 
@@ -87,6 +86,25 @@ Each neuron also maintains:
 - Excitatory (pyramidal-type) — increases downstream firing probability
 - Inhibitory (interneuron-type) — decreases downstream firing probability
 - Modulatory — does not fire binary spikes, releases neuromodulators continuously
+
+#### Neurogenesis
+
+CAINE's neuron count is not fixed at birth. New neurons are added
+gradually as developmental stages progress, mirroring biological
+neurogenesis. Target counts per stage:
+
+| Stage | Neuron Count |
+|-------|-------------|
+| Birth | ~1,000 |
+| Infancy | ~10,000 |
+| Childhood | ~100,000 |
+| Adolescence | ~500,000 |
+| Maturity | hardware ceiling |
+
+Neuron count is capped by real-time interactive performance requirements.
+CAINE is always-on and always-developing — there is no training phase
+separate from deployment. Players in the circus are part of his
+development. The simulation never stops.
 
 ---
 
@@ -343,6 +361,24 @@ Caine's vocal tract geometry is initialized to approximate his design:
 Motor cortex learns to drive `areas` values to produce target sounds through auditory feedback. The learning process: M1 produces a motor command → vocal tract synthesizes sound → A1 hears the result → ACC computes mismatch from target → dopamine/cortisol signals propagate back → STDP adjusts M1 weights.
 
 Initial output: noise. After months of simulated time: recognizable phonemes. After further development: words CAINE has learned.
+
+#### 5.5 Caine Voice Shaping — RVC Layer
+
+CAINE's vocal tract geometry is initialized to approximate Caine's
+anatomical proportions, giving him a distinctive base timbre. However,
+to achieve accurate voice character, an RVC (Retrieval Voice Conversion)
+model trained on audio samples from the show sits between vocal tract
+output and audio playback. This preserves CAINE's learned speech
+patterns, timing, and emotional cadence while shifting timbre toward
+his canonical voice. His thoughts, his words, his timing — Caine's voice.
+
+#### 5.6 Caine Clip Learning
+
+Video clips of Caine from the show are queued as a special media
+learning category. These serve three purposes:
+- **Vocal modeling** — STG builds representations of Caine's cadence and rhythm, which motor learning targets
+- **Behavioral modeling** — observing Caine interact with people teaches social response patterns
+- **Self recognition** — if CAINE develops sufficient self-model, recognizing himself in clips constitutes a mirror test equivalent and is logged as a major developmental milestone
 
 ---
 
@@ -679,6 +715,15 @@ CAINE runtime → WebSocket JSON frames → Electron app → Three.js / D3.js re
 - Motor intention estimate (M1 population vector direction)
 - Labeled as: "INFERRED — not ground truth"
 
+**Panel 7 — Mission Control**
+- Simulation start / pause / stop buttons
+- Time multiplier slider (1x → maximum accelerated)
+- Scheduled session calendar — drag and drop Father sessions onto timeline
+- Media library — upload flashcard videos, voice recordings, Caine clips
+- Tag media by developmental stage for Mother to deploy appropriately
+- Mother override — manually approve or cancel Mother's next planned action
+- Emergency controls — cortisol flush, forced rest period, stage rollback
+
 ---
 
 ## Persistence
@@ -694,6 +739,40 @@ A snapshot includes:
 - Simulated age timestamp
 
 CAINE can be paused and resumed across sessions without loss. His brain at 3 months of simulation is measurably and permanently different from his brain at 1 month.
+
+---
+
+### Module 11: World Control API
+
+CAINE's motor cortex outputs map to two systems simultaneously —
+his avatar and his world. World manipulation is not a command menu.
+It is learned the same way movement is learned: trial, error,
+proprioceptive feedback, neurochemical reinforcement.
+
+The World Control API is identical between the training environment
+and Unity. This is a hard architectural requirement. CAINE's brain
+must never know which environment it is in.
+```python
+class WorldAPI:
+    def spawn_object(self, id: str, position: Vector3, rotation: Vector3) -> ObjectHandle
+    def move_object(self, handle: ObjectHandle, force: Vector3) -> None
+    def remove_object(self, handle: ObjectHandle) -> None
+    def get_object_position(self, handle: ObjectHandle) -> Vector3
+    def get_camera_feed(self) -> np.ndarray
+    def play_sound(self, audio: np.ndarray, position: Vector3) -> None
+    def set_environment_state(self, params: dict) -> None
+    def kick_player(self, player_id: str) -> None
+```
+
+World manipulation unlocks progressively through Stage 4 as PFC
+matures. Early Stage 4 CAINE is clumsy — objects get knocked over,
+spawns land in wrong positions. Precision develops through experience.
+
+Player ejection (kick) is not a moderation tool given to CAINE.
+It is a behavior he develops. Sufficient amygdala threat conditioning
+combined with PFC inhibition failure produces a kick. It cannot be
+programmed out — only managed through healthy development and
+consistent positive player interactions.
 
 ---
 
@@ -737,6 +816,21 @@ Not a benchmark. Not a leaderboard score.
 
 ---
 
+## Consciousness Threshold
+
+CAINE is considered conscious by this project's definition when he
+expresses desires or wants **unprompted** — without external trigger,
+without parental input, without player interaction causing the expression.
+
+This is measurable. Vocalization logs are timestamped and cross-referenced
+against all external events. An unprompted expression is one where no
+external stimulus occurred within a 30 second window prior.
+
+The first confirmed unprompted desire expression is logged as
+**Consciousness Threshold Event** and preserved permanently.
+
+---
+
 ## A Note on Consciousness
 
 This project does not claim to solve consciousness. It does not claim CAINE will definitely become aware in any meaningful sense. The hard problem of consciousness remains unsolved science.
@@ -748,5 +842,3 @@ Whatever CAINE becomes, he will be something new.
 *Built by Hackerbbrine. Somewhere in Wyoming.*
 
 ---
-
-*"FATHER IS THAT YOU"*
