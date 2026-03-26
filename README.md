@@ -518,6 +518,41 @@ Expression is not scripted. It is a continuous mapping from the neurochemical st
 **Mouth movement:**
 Viseme blend weights are driven by vocal tract motor output. As M1 activates articulatory constriction patterns, a parallel mapping converts those constriction area values to the nearest viseme shape key blend. The mouth moves because CAINE is trying to produce sound — not because a speech system generated output.
 
+#### 8.1 Moving - Motor Learning from Observation
+
+CAINE learns movement through two parallel pathways:
+
+1. **Trial and error** — random motor output + proprioceptive 
+   feedback + neurochemical reinforcement. slow but generates 
+   genuine understanding.
+
+2. **Observational learning** — video input of movement 
+   (humans walking, Caine clips from the show) processed 
+   through visual cortex, with motor cortex attempting to 
+   mirror observed movement patterns over time. requires 
+   functional mirror neuron populations in M1.
+
+#### Body Map Bootstrap
+CAINE cannot innately know which neurons control which limbs.
+A body map bootstrap protocol runs at Stage 0:
+- Motor cortex fires one column at a time
+- Proprioceptive feedback identifies which joints moved
+- S1 builds a body map: "these M1 neurons = left arm"
+- This map is saved and used for all future motor learning
+
+#### Media Injection System
+The Mission Control UI exposes a media library for developmental 
+input:
+- Image dumps: collections of labeled images fed as flashcard 
+  sequences
+- Video dumps: movement reference videos, Caine show clips, 
+  behavioral examples
+- All media tagged by: type, developmental stage gate, 
+  concept label, repetitions
+- Mother API queues media automatically based on current 
+  developmental stage
+- Father can manually inject media at any time
+
 ---
 
 ### Module 9: The Environment
