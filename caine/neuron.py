@@ -197,9 +197,9 @@ def run_simulation(
     m0, h0, n0 = gate_steady_state(V_rest)
     state0 = [V_rest, m0, h0, n0]
 
-    print(f"[CAINE] Resting gate values → m={m0:.4f}, h={h0:.4f}, n={n0:.4f}")
-    print(f"[CAINE] Simulating {duration_ms} ms | I_ext={I_ext_amplitude} µA/cm² "
-          f"({I_start_ms}–{I_stop_ms} ms) ...")
+    print(f"[CAINE] Resting gate values -> m={m0:.4f}, h={h0:.4f}, n={n0:.4f}")
+    print(f"[CAINE] Simulating {duration_ms} ms | I_ext={I_ext_amplitude} uA/cm2 "
+          f"({I_start_ms}-{I_stop_ms} ms) ...")
 
     # Integrate the ODEs
     states = odeint(hh_odes, state0, t, args=(I_ext,))
@@ -217,7 +217,7 @@ def run_simulation(
         isi = np.diff(spike_times)
         print(f"[CAINE] Mean ISI: {isi.mean():.2f} ms | "
               f"Firing rate: {len(spike_times) / (duration_ms / 1000):.1f} Hz"
-              if len(isi) > 0 else "[CAINE] Single spike — no ISI")
+              if len(isi) > 0 else "[CAINE] Single spike - no ISI")
 
     # Print spike log
     print("\n--- Spike Log ---")
@@ -226,7 +226,7 @@ def run_simulation(
             print(f"  Spike #{entry['spike_num']:3d}  t={entry['time_ms']:8.3f} ms  "
                   f"V={entry['V_mV']:+7.2f} mV")
     else:
-        print("  (no spikes detected — try increasing I_ext_amplitude)")
+        print("  (no spikes detected - try increasing I_ext_amplitude)")
 
     return t, V, states, (spike_times, spike_log)
 
