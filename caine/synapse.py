@@ -19,6 +19,11 @@ No ML frameworks — only numpy and scipy.
 """
 
 import os
+import sys as _sys
+_PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), '..'))
+if _PROJECT_ROOT not in _sys.path:
+    _sys.path.insert(0, _PROJECT_ROOT)
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
