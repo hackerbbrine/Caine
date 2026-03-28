@@ -2,3 +2,22 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# Environment / secrets
+.env
+.env.local
+*.env
+
+# CAINE runtime data (large / sensitive / generated)
+output/voiceprint.json
+output/body_map.json
+output/body_map_demo.json
+output/checkpoint.h5
+output/checkpoint.npz
+output/checkpoint_meta.json
+output/mother_log.jsonl
+output/neurogenesis_log.jsonl
+output/viz_test.png
+output/wav_zoom.png
+output/voiceprint_demo.json
+data/

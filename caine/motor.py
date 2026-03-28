@@ -165,11 +165,15 @@ MOTOR_SCORE_TAU              = 150   # frames for motor learning score average
 # SECTION 2 — COLUMN DEFINITIONS
 # ===========================================================================
 # Each entry: (name, output_type, neuron_start, n_neurons)
-# Total: 4+3+3+3+3+3 + 2*6 + 2+2+3+2 = 19+12+9 = 40 neurons
+# Total: 4+3+3+3+3+3 + 2*6 + 2+2+3+2 + 2*10 = 19+12+9+20 = 60 neurons
 
-JOINT_NAMES      = ['spine', 'head', 'arm_L', 'arm_R', 'leg_L', 'leg_R']
-ARTICULATOR_NAMES = ['lips', 'teeth', 'alveolar', 'palate', 'velum', 'glottis']
+JOINT_NAMES        = ['spine', 'head', 'arm_L', 'arm_R', 'leg_L', 'leg_R']
+ARTICULATOR_NAMES  = ['lips', 'teeth', 'alveolar', 'palate', 'velum', 'glottis']
 WORLD_ACTION_NAMES = ['grab', 'push', 'spawn', 'remove']
+FINGER_NAMES       = [
+    'thumb_L', 'index_L', 'middle_L', 'ring_L', 'pinky_L',
+    'thumb_R', 'index_R', 'middle_R', 'ring_R', 'pinky_R',
+]
 
 _COLUMNS: List[Tuple[str, str, int, int]] = [
     # --- avatar joints ---
@@ -191,8 +195,20 @@ _COLUMNS: List[Tuple[str, str, int, int]] = [
     ('push',      'world',       33,  2),
     ('spawn',     'world',       35,  3),
     ('remove',    'world',       38,  2),
+    # --- finger curl  (left hand, then right hand) ---
+    # curl value: 0.0 = fully extended, 1.0 = fully curled
+    ('thumb_L',   'finger',      40,  2),
+    ('index_L',   'finger',      42,  2),
+    ('middle_L',  'finger',      44,  2),
+    ('ring_L',    'finger',      46,  2),
+    ('pinky_L',   'finger',      48,  2),
+    ('thumb_R',   'finger',      50,  2),
+    ('index_R',   'finger',      52,  2),
+    ('middle_R',  'finger',      54,  2),
+    ('ring_R',    'finger',      56,  2),
+    ('pinky_R',   'finger',      58,  2),
 ]
-N_M1_NEURONS = 40   # sum of n_neurons above
+N_M1_NEURONS = 60   # sum of n_neurons above
 
 # Pre-built numpy array mapping neuron index → column index
 _NEURON_COLUMN = np.zeros(N_M1_NEURONS, dtype=int)
@@ -201,8 +217,9 @@ for _col_i, (_n, _t, _s, _k) in enumerate(_COLUMNS):
 
 # Neuron index slices for targeted chemical input currents.
 # Keep in sync with _COLUMNS if column layout ever changes.
-_HEAD_SLICE = slice(_COLUMNS[1][2], _COLUMNS[1][2] + _COLUMNS[1][3])    # head: 4..7
-_ART_SLICE  = slice(_COLUMNS[6][2], _COLUMNS[11][2] + _COLUMNS[11][3])  # art: 19..31
+_HEAD_SLICE   = slice(_COLUMNS[1][2],  _COLUMNS[1][2]  + _COLUMNS[1][3])   # head:   4..7
+_ART_SLICE    = slice(_COLUMNS[6][2],  _COLUMNS[11][2] + _COLUMNS[11][3])  # art:   19..31
+_FINGER_SLICE = slice(_COLUMNS[16][2], _COLUMNS[25][2] + _COLUMNS[25][3])  # finger: 40..60
 
 
 # ===========================================================================
@@ -307,7 +324,7 @@ class MotorPopulation:
         Only meaningful if n == N_M1_NEURONS.
         """
         if self.n != N_M1_NEURONS:
-            raise ValueError("column_fractions() only valid for M1 population (40 neurons)")
+            raise ValueError("column_fractions() only valid for M1 population (60 neurons)")
         fracs = np.zeros(len(_COLUMNS))
         recent_fired = np.array([
             bool(self.spike_times[i] and
@@ -850,10 +867,11 @@ class MotorCortex:
     """
     Primary Motor Cortex (M1) + Mirror Neuron System.
 
-    40 HH neurons in 16 motor columns:
-        Columns 0-5   : avatar joints  (spine → leg_R)
-        Columns 6-11  : vocal articulators (lips → glottis)
-        Columns 12-15 : world-action stubs (grab → remove)
+    60 HH neurons in 26 motor columns:
+        Columns 0-5   : avatar joints  (spine -> leg_R)
+        Columns 6-11  : vocal articulators (lips -> glottis)
+        Columns 12-15 : world-action stubs (grab -> remove)
+        Columns 16-25 : finger curl (thumb_L..pinky_L, thumb_R..pinky_R)
 
     20 mirror neurons observe visual motion and produce a motor learning
     signal through observation, without CAINE needing to move.
@@ -891,6 +909,9 @@ class MotorCortex:
         # --- State: articulators ---
         self.vocal_tract = VocalTract(self._rng)
 
+        # --- State: fingers (curl 0.0=extended, 1.0=fully curled) ---
+        self.finger_positions = np.full(10, 0.5, dtype=np.float32)
+
         # --- Locomotion system ---
         self.locomotion = LocomotionSystem(self._rng)
 
@@ -906,9 +927,10 @@ class MotorCortex:
         self._mismatch_history: deque = deque(maxlen=80)
 
         # --- Rolling histories for visualisation ---
-        self._m1_history     = deque(maxlen=80)  # (60,) bool each frame
+        self._m1_history     = deque(maxlen=80)  # (80,) bool each frame  (60 M1 + 20 mirror)
         self._joint_history  = deque(maxlen=80)  # (6,) float per frame
         self._art_history    = deque(maxlen=80)  # (6,) float per frame
+        self._finger_history = deque(maxlen=80)  # (10,) float per frame
 
         # --- Media library ---
         self.media = MediaLibrary(media_lib_file)
@@ -959,7 +981,7 @@ class MotorCortex:
             joint_angles    : (6,) float32 — current actual joint angles (radians)
             joint_targets   : (6,) float32 — M1-commanded targets
             art_positions   : (6,) float32 — articulator positions [0,1]
-            m1_spikes       : (40,) bool   — M1 population spikes this frame
+            m1_spikes       : (60,) bool   — M1 population spikes this frame
             mirror_spikes   : (20,) bool   — mirror neuron spikes
             efference_mismatch : float     — S1 prediction error (0..1)
             world_actions   : list[WorldAction] — pending world events
@@ -1030,6 +1052,9 @@ class MotorCortex:
                 sensory_drive[start:start+k] = a1_mean * 3.0
             elif otype == 'world':
                 sensory_drive[start:start+k] = (v1_mean + a1_mean) * 0.75
+            elif otype == 'finger':
+                # Fingers receive visual + auditory drive (low gain — fine motor)
+                sensory_drive[start:start+k] = (v1_mean + a1_mean) * 1.0
 
         noise = self._rng.normal(0.0, noise_sigma, N_M1_NEURONS)
 
@@ -1101,6 +1126,16 @@ class MotorCortex:
         art_col_fracs = self.column_fractions[6:12].astype(np.float32)
         art_positions = self.vocal_tract.update(art_col_fracs, ach, dt_ms)
 
+        # ------ 12b. Finger curl update ------------------------------------
+        # Column firing fraction (0-1) maps directly to curl (0=extended, 1=curled).
+        # Lerp toward target with light noise — identical rhythm to articulators.
+        finger_col_fracs = self.column_fractions[16:26].astype(np.float32)
+        finger_noise = self._rng.normal(0.0, ART_NOISE_SIGMA, 10).astype(np.float32)
+        finger_targets = np.clip(finger_col_fracs + finger_noise, 0.0, 1.0)
+        lerp_f = float(np.clip(dt_ms / 50.0, 0.0, 1.0))
+        self.finger_positions += lerp_f * (finger_targets - self.finger_positions)
+        self.finger_positions  = np.clip(self.finger_positions, 0.0, 1.0)
+
         # ------ 13. World stub check ---------------------------------------
         self._world_queue.clear()
         for col_i, name in enumerate(WORLD_ACTION_NAMES):
@@ -1120,11 +1155,13 @@ class MotorCortex:
         self._m1_history.append(combined_spikes)
         self._joint_history.append(self.joint_angles.copy())
         self._art_history.append(art_positions.copy())
+        self._finger_history.append(self.finger_positions.copy())
 
         return {
             'joint_angles':          self.joint_angles,
             'joint_targets':         self.joint_targets,
             'art_positions':         art_positions,
+            'finger_positions':      self.finger_positions.copy(),
             'm1_spikes':             m1_spikes_accum,
             'mirror_spikes':         mirror_spikes,
             'column_fractions':      self.column_fractions.copy(),
@@ -1206,6 +1243,7 @@ def extend_visualizer(viz) -> None:
     viz._mismatch_history_vz = deque(maxlen=HISTORY)
     viz._joint_history_vz    = deque(maxlen=HISTORY)
     viz._art_history_vz      = deque(maxlen=HISTORY)
+    viz._finger_history_vz   = deque(maxlen=HISTORY)
 
     # We'll build motor axes lazily at first update
     viz._motor_axes_built = False
@@ -1234,18 +1272,19 @@ def extend_visualizer(viz) -> None:
             viz._axes[label] = ax
             return ax
 
-        # Row 4: three motor panels
+        # Row 4: three motor panels; Row 5: finger panel
         # [left, bottom, width, height]  — figure coords 0-1
-        ax_m1    = _moto_ax(0.06,  0.01, 0.28, 0.15, 'm1_raster')
-        ax_joint = _moto_ax(0.385, 0.01, 0.28, 0.15, 'm1_joints')
-        ax_art   = _moto_ax(0.71,  0.01, 0.26, 0.15, 'm1_art')
+        ax_m1    = _moto_ax(0.06,  0.09, 0.28, 0.13, 'm1_raster')
+        ax_joint = _moto_ax(0.385, 0.09, 0.28, 0.13, 'm1_joints')
+        ax_art   = _moto_ax(0.71,  0.09, 0.26, 0.13, 'm1_art')
+        ax_fing  = _moto_ax(0.06,  0.01, 0.90, 0.07, 'm1_fingers')
 
-        # M1 raster (60 neurons = 40 M1 + 20 mirror)
-        ax_m1.set_title("M1 + Mirror raster (40+20 neurons)", fontsize=9)
+        # M1 raster (80 neurons = 60 M1 + 20 mirror)
+        ax_m1.set_title("M1 + Mirror raster (60+20 neurons)", fontsize=9)
         ax_m1.set_xlabel("time (frames)", fontsize=7)
         ax_m1.set_ylabel("neuron", fontsize=7)
         viz._artists['m1_img'] = ax_m1.imshow(
-            np.zeros((60, 1)), aspect='auto', cmap='plasma',
+            np.zeros((80, 1)), aspect='auto', cmap='plasma',
             vmin=0, vmax=1, interpolation='nearest')
 
         # Joint bar chart (current blue, target orange)
@@ -1291,6 +1330,23 @@ def extend_visualizer(viz) -> None:
             [], [], lw=1.5, color='#e74c3c', label='mismatch')
         viz._axes['m1_art_twin'] = ax_mis
 
+        # Finger curl bar chart (10 fingers, 0=extended, 1=curled)
+        ax_fing.set_title("Finger curl  [0=extended, 1=curled]", fontsize=9)
+        ax_fing.set_xlabel("finger", fontsize=7)
+        ax_fing.set_ylabel("curl [0-1]", fontsize=7)
+        ax_fing.set_xlim(-0.5, 9.5)
+        ax_fing.set_ylim(-0.05, 1.05)
+        ax_fing.set_xticks(range(10))
+        ax_fing.set_xticklabels(
+            ['th_L', 'ix_L', 'md_L', 'rg_L', 'pk_L',
+             'th_R', 'ix_R', 'md_R', 'rg_R', 'pk_R'],
+            fontsize=6, rotation=30)
+        _fcols = (['#3498db'] * 5) + (['#e74c3c'] * 5)  # blue=left, red=right
+        viz._artists['finger_bars'] = ax_fing.bar(
+            np.arange(10), np.zeros(10), width=0.7,
+            color=_fcols, linewidth=0)
+        ax_fing.axvline(4.5, color='#555555', lw=0.8, ls='--')  # L/R divider
+
         viz._motor_axes_built = True
 
     viz._build_figure = _build_figure_extended
@@ -1313,6 +1369,8 @@ def extend_visualizer(viz) -> None:
                 motor_result['joint_angles'].copy())
             viz._art_history_vz.append(
                 motor_result['art_positions'].copy())
+            viz._finger_history_vz.append(
+                motor_result['finger_positions'].copy())
 
         # Call original (handles sensory + limbic + figure construction)
         _orig_update(result, frame_rgb, audio_frame,
@@ -1333,7 +1391,7 @@ def _draw_motor(viz, motor_result: dict) -> None:
     """Draw all motor panels into the extended figure."""
     # --- M1 raster ---------------------------------------------------------
     if viz._m1_history_motor:
-        mat = np.array(viz._m1_history_motor).T  # (60, time)
+        mat = np.array(viz._m1_history_motor).T  # (80, time)
         viz._artists['m1_img'].set_data(mat)
         viz._artists['m1_img'].set_extent([0, mat.shape[1], mat.shape[0], 0])
         ax = viz._axes['m1_raster']
@@ -1369,6 +1427,12 @@ def _draw_motor(viz, motor_result: dict) -> None:
         times = np.arange(len(viz._mismatch_history_vz))
         viz._artists['mismatch_line'].set_data(times, list(viz._mismatch_history_vz))
         viz._axes['m1_art_twin'].set_xlim(0, max(1, len(times) - 1))
+
+    # --- Finger curl bars --------------------------------------------------
+    if hasattr(viz, '_finger_history_vz') and viz._finger_history_vz:
+        fpos = viz._finger_history_vz[-1]   # (10,) latest frame
+        for bar, v in zip(viz._artists['finger_bars'], fpos):
+            bar.set_height(float(v))
 
 
 # ===========================================================================
@@ -1426,11 +1490,12 @@ def run_motor_demo(n_frames: int = 200, dt_ms: float = 20.0) -> None:
 
     joint_trace    = []   # (n_frames, 6)
     art_trace      = []   # (n_frames, 6)
+    finger_trace   = []   # (n_frames, 10)
     mismatch_trace = []
     score_trace    = []
     da_trace       = []
     cort_trace     = []
-    m1_raster      = []   # (n_frames, 60)
+    m1_raster      = []   # (n_frames, 80)  (60 M1 + 20 mirror)
     loco_trace     = []   # locomotion mode per frame (str)
     loco_sim_trace = {m: [] for m in LocomotionSystem.MODES}
 
@@ -1461,6 +1526,7 @@ def run_motor_demo(n_frames: int = 200, dt_ms: float = 20.0) -> None:
 
         joint_trace.append(result['joint_angles'].copy())
         art_trace.append(result['art_positions'].copy())
+        finger_trace.append(result['finger_positions'].copy())
         mismatch_trace.append(result['efference_mismatch'])
         score_trace.append(result['motor_learning_score'])
         da_trace.append(snap.get('dopamine', 0.1))
@@ -1479,9 +1545,9 @@ def run_motor_demo(n_frames: int = 200, dt_ms: float = 20.0) -> None:
     print(f"\n[motor demo] Done.")
 
     # ---- Plot ------------------------------------------------------------
-    fig = plt.figure(figsize=(15, 11))
+    fig = plt.figure(figsize=(15, 14))
     fig.patch.set_facecolor('#111111')
-    gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.55, wspace=0.35)
+    gs  = gridspec.GridSpec(4, 3, figure=fig, hspace=0.55, wspace=0.35)
     t   = np.arange(n_frames) * dt_ms / 1000.0
 
     # Stage change markers
@@ -1510,14 +1576,16 @@ def run_motor_demo(n_frames: int = 200, dt_ms: float = 20.0) -> None:
         return ax
 
     # M1 raster
-    ax0 = _ax(0, 0, "M1 + Mirror raster (40+20 neurons)")
+    ax0 = _ax(0, 0, "M1 + Mirror raster (60+20 neurons)")
     mat = np.array(m1_raster).T
     ax0.imshow(mat, aspect='auto', cmap='plasma', vmin=0, vmax=1,
                interpolation='nearest',
                extent=[t[0], t[-1], mat.shape[0], 0])
     ax0.set_ylabel("neuron", fontsize=7, color='#aaaaaa')
-    ax0.axhline(40, color='#00ccff', lw=0.7, ls='--')
-    ax0.text(t[-1] * 0.02, 38, 'mirror', fontsize=5, color='#00ccff', va='bottom')
+    ax0.axhline(60, color='#00ccff', lw=0.7, ls='--')
+    ax0.text(t[-1] * 0.02, 58, 'mirror', fontsize=5, color='#00ccff', va='bottom')
+    ax0.axhline(40, color='#00ff88', lw=0.5, ls=':')
+    ax0.text(t[-1] * 0.02, 38, 'fingers', fontsize=5, color='#00ff88', va='bottom')
     ax0.grid(False)
 
     # Joint angles
@@ -1605,7 +1673,35 @@ def run_motor_demo(n_frames: int = 200, dt_ms: float = 20.0) -> None:
     ax8.legend(fontsize=6, facecolor='#222222', labelcolor='white',
                framealpha=0.7, ncol=2)
 
-    fig.suptitle("CAINE Module 8 — Motor Cortex + Locomotion System (emergent)",
+    # Finger curl traces  (left hand blue shades, right hand red shades)
+    ax_fL = _ax(3, 0, "Finger curl — left hand  [M1-emergent, 0=ext, 1=curl]",
+                ylabel='curl')
+    ax_fR = _ax(3, 1, "Finger curl — right hand  [M1-emergent]", ylabel='curl')
+    ft = np.array(finger_trace)   # (n_frames, 10)
+    blues = ['#5dade2','#2e86c1','#1a5276','#7fb3d3','#a9cce3']
+    reds  = ['#e74c3c','#c0392b','#922b21','#f1948a','#f5b7b1']
+    for i, (name, col) in enumerate(zip(FINGER_NAMES[:5], blues)):
+        ax_fL.plot(t, ft[:, i],   lw=1.0, color=col, label=name)
+    for i, (name, col) in enumerate(zip(FINGER_NAMES[5:], reds)):
+        ax_fR.plot(t, ft[:, i+5], lw=1.0, color=col, label=name)
+    for ax_ in (ax_fL, ax_fR):
+        ax_.set_ylim(-0.05, 1.05)
+        ax_.axhline(0.5, color='#555555', lw=0.5, ls='--')
+        ax_.legend(fontsize=6, facecolor='#222222', labelcolor='white',
+                   framealpha=0.7, ncol=2)
+
+    # Articulator positions (row 3, col 2)
+    ax_art_demo = _ax(3, 2, "Vocal tract articulators  [M1-emergent]",
+                      ylabel='position [0-1]')
+    art_colors = ['#e74c3c','#e67e22','#2ecc71','#27ae60','#3498db','#9b59b6']
+    atr = np.array(art_trace)
+    for i, (name, col) in enumerate(zip(ARTICULATOR_NAMES, art_colors)):
+        ax_art_demo.plot(t, atr[:, i], lw=1.0, color=col, label=name)
+    ax_art_demo.set_ylim(-0.05, 1.05)
+    ax_art_demo.legend(fontsize=6, facecolor='#222222', labelcolor='white',
+                       framealpha=0.7, ncol=2)
+
+    fig.suptitle("CAINE Module 8 — Motor Cortex + Locomotion + Fingers (emergent)",
                  fontsize=12, color='#ffffff')
     out = os.path.join(_OUTPUT_DIR, 'caine_module8_motor.png')
     plt.savefig(out, dpi=120, bbox_inches='tight', facecolor='#111111')
