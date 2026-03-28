@@ -178,10 +178,12 @@ class LiveVisualizer:
         self._fig.patch.set_facecolor('#111111')
         plt.get_current_fig_manager().set_window_title("CAINE — Live Sensory Feed")
 
+        # bottom=0.27 leaves clear space for the two motor rows that
+        # extend_visualizer (motor.py) injects at y=[0.01, 0.22].
         gs = gridspec.GridSpec(4, 3, figure=self._fig,
-                               hspace=0.50, wspace=0.35,
+                               hspace=0.55, wspace=0.35,
                                left=0.06, right=0.97,
-                               top=0.96, bottom=0.05)
+                               top=0.96, bottom=0.27)
 
         def _ax(r, c, label):
             ax = self._fig.add_subplot(gs[r, c])
@@ -277,9 +279,10 @@ class LiveVisualizer:
         blank = np.zeros((64, 64, 3), dtype=np.uint8)
         self._artists['cam'] = ax_cam.imshow(blank, interpolation='nearest')
 
-        # DoG image
+        # DoG image — seismic keeps the diverging red/blue meaning but maps
+        # exactly-zero to black (dark background) instead of white.
         self._artists['dog'] = ax_dog.imshow(
-            np.zeros((64, 64)), cmap='RdBu_r', vmin=-1, vmax=1,
+            np.zeros((64, 64)), cmap='seismic', vmin=-1, vmax=1,
             interpolation='nearest')
 
         # Mel bars
@@ -328,9 +331,10 @@ class LiveVisualizer:
             np.zeros((40, 1)), aspect='auto', cmap='hot',
             vmin=0, vmax=1, interpolation='nearest')
 
-        # CA1 / ACC stacked raster
+        # CA1 / ACC stacked raster — 'plasma' maps 0→near-black and 1→bright
+        # yellow, so an inactive raster is dark (not the blinding cyan of 'cool').
         self._artists['ca1_img'] = ax_ca1.imshow(
-            np.zeros((40, 1)), aspect='auto', cmap='cool',
+            np.zeros((40, 1)), aspect='auto', cmap='plasma',
             vmin=0, vmax=1, interpolation='nearest')
 
         # Felt valence and arousal lines
