@@ -1,5 +1,5 @@
 """
-CAINE - Module 3: Neurochemical System
+CAINE - Module 4: Neurochemical System
 =======================================
 Simulates CAINE's neuromodulatory system as six coupled differential
 equations. These are NOT scalar reward signals -- they are dynamic
@@ -21,12 +21,17 @@ Core ODE (per chemical C with baseline B and time-constant tau):
 Solved exactly each timestep:
   C(t+dt) = B + (C(t) - B) * exp(-dt/tau) + sum(pulse_releases)
 
-Modulation outputs (consumed by Modules 1 & 2):
-  stdp_scale()          -- multiplier on STDP A+/A-  (DA + ACh + OT)
-  learning_gate()       -- ACh threshold gate; STDP -> ~0 when gate < 0.1
-  health_decay_mod()    -- synapse health tau modifier (5HT slows, CORT speeds)
-  global_gain()         -- neuron threshold shift (NE raises sensitivity)
-  memory_gate()         -- hippocampal encoding gate (suppressed by CORT)
+Modulation outputs (consumed by Modules 1, 2, 3):
+  stdp_scale()                      -- global STDP multiplier (DA + ACh + OT)
+  learning_gate()                   -- ACh gate; STDP -> ~0 when gate < 0.1
+  health_decay_mod()                -- synapse health tau modifier (5HT slows, CORT speeds)
+  global_gain()                     -- neuron excitability (NE raises sensitivity)
+  memory_gate()                     -- hippocampal CA1 encoding (suppressed by CORT)
+  dopamine_motor_bias()             -- DA-driven approach/exploration bias for M1
+  oxytocin_stg_scale()              -- OT-specific STDP for STG / social regions
+  serotonin_amygdala_mod()          -- 5HT reduces amygdala reactivity
+  vocalization_drive()              -- OT-driven vocalization attempt boost
+  cortisol_is_chronically_elevated()-- True when CORT > chronic stress threshold
 
 Integrates cleanly with Module 2's Synapse via modulate_synapse().
 
@@ -265,13 +270,16 @@ class NeurochemicalSystem:
 
     def stdp_scale(self) -> float:
         """
-        Combined STDP amplitude multiplier.
+        Global STDP amplitude multiplier (all cortical regions).
 
         Driven by dopamine (reward learning), acetylcholine (attention gate),
-        and oxytocin (social region booster).
+        and oxytocin (global component).
 
         At baseline levels this returns ~1.0 (no change).
         High DA + ACh -> strong potentiation; low ACh -> near-zero STDP.
+
+        For STG / social-region-specific STDP, use oxytocin_stg_scale() instead --
+        that method provides the targeted OT boost described in the README.
 
         Formula:
           scale = learning_gate * (1 + DA_gain*(DA - DA_base) + OT_gain*(OT - OT_base))
@@ -343,6 +351,82 @@ class NeurochemicalSystem:
         """
         return float(np.clip(1.0 - 1.2 * self.cortisol, 0.0, 1.0))
 
+    def dopamine_motor_bias(self) -> float:
+        """
+        Dopamine-driven approach / exploration bias for motor cortex.
+
+        README: "drives approach and exploratory behavior via motor cortex bias"
+
+        Returns a float in [0.0, 1.0]:
+          0.5 = neutral (at baseline DA)
+          > 0.5 = approach-biased (elevated DA)
+          < 0.5 = withdrawal-biased (suppressed DA, e.g. reward omission)
+        Motor cortex applies this as an asymmetric drive toward exploratory
+        movements; values above 0.5 increase amplitude of random motor noise.
+        """
+        da_base = self._chemicals['dopamine'].baseline
+        return float(np.clip(0.5 + 1.5 * (self.dopamine - da_base), 0.0, 1.0))
+
+    def oxytocin_stg_scale(self) -> float:
+        """
+        Oxytocin-specific STDP multiplier for STG and social cognition regions.
+
+        README: "scales STDP specifically in STG and social cognition regions"
+        Distinct from the global stdp_scale() -- this is a targeted boost that
+        strengthens the binding between STG phoneme/voice patterns and the
+        limbic/reward system when oxytocin is elevated (parent voice recognised,
+        successful communication).
+
+        At OT baseline: returns 1.0 (no change).
+        At peak OT (1.0): returns up to ~4.0.
+        """
+        ot_base = self._chemicals['oxytocin'].baseline
+        return float(np.clip(1.0 + 3.0 * (self.oxytocin - ot_base), 0.0, 4.0))
+
+    def serotonin_amygdala_mod(self) -> float:
+        """
+        Serotonin-driven reduction in amygdala reactivity to ambiguous stimuli.
+
+        README: "emotional stability, reduced amygdala reactivity to ambiguous stimuli"
+
+        Returns a multiplier on amygdala drive [0.2, 1.0].
+        Amygdala BLA and CeA populations should multiply their computed drive
+        by this value before stepping.
+          At 5HT baseline: returns 1.0 (no damping).
+          At peak 5HT:     returns ~0.2 (strong damping -- calm, stable state).
+        """
+        ht_base = self._chemicals['serotonin'].baseline
+        return float(np.clip(1.0 - 1.5 * (self.serotonin - ht_base), 0.2, 1.0))
+
+    def vocalization_drive(self) -> float:
+        """
+        Oxytocin-driven vocalization attempt probability boost.
+
+        README: "increases vocalization attempts" when oxytocin is elevated
+        (parent voice recognised, successful two-way communication).
+
+        Returns a float in [0.0, 1.0] that the motor cortex mouth sub-region
+        adds to its baseline excitability -- higher values increase the
+        probability that CAINE initiates a vocalization this frame.
+        """
+        ot_base = self._chemicals['oxytocin'].baseline
+        return float(np.clip(2.0 * (self.oxytocin - ot_base), 0.0, 1.0))
+
+    def cortisol_is_chronically_elevated(self, threshold: float = 0.25) -> bool:
+        """
+        Returns True when cortisol is above the chronic stress threshold.
+
+        README: "CAINE should not be chronically stressed.
+                 The parenting system monitors cortisol baseline."
+
+        The parenting system calls this every update cycle.  Persistent True
+        returns trigger a comfort / soothing interaction from Father.
+
+        Default threshold 0.25 corresponds to cortisol roughly 3x its
+        resting baseline (0.08).
+        """
+        return bool(self.cortisol > threshold)
+
     # ------------------------------------------------------------------
     # 5.4  Integration with Module 2: modulate a Synapse object in-place
     # ------------------------------------------------------------------
@@ -376,7 +460,7 @@ class NeurochemicalSystem:
                 for name, chem in self._chemicals.items()}
 
     def print_state(self, t: float = 0.0) -> None:
-        """Print a formatted one-line state summary to stdout."""
+        """Print a formatted two-line state summary to stdout."""
         s = self.snapshot()
         print(
             f"[NEURO] t={t:8.1f}ms  "
@@ -385,10 +469,17 @@ class NeurochemicalSystem:
             f"CORT={s['cortisol']:.3f}  "
             f"OT={s['oxytocin']:.3f}  "
             f"NE={s['norepinephrine']:.3f}  "
-            f"ACh={s['acetylcholine']:.3f}  "
-            f"| gate={self.learning_gate():.3f}  "
+            f"ACh={s['acetylcholine']:.3f}"
+        )
+        print(
+            f"[NEURO]          "
+            f"gate={self.learning_gate():.3f}  "
             f"stdp_x={self.stdp_scale():.3f}  "
-            f"health_mod={self.health_decay_mod():.3f}"
+            f"stg_x={self.oxytocin_stg_scale():.3f}  "
+            f"health_mod={self.health_decay_mod():.3f}  "
+            f"motor_bias={self.dopamine_motor_bias():.3f}  "
+            f"voc_drive={self.vocalization_drive():.3f}  "
+            f"chronic_stress={self.cortisol_is_chronically_elevated()}"
         )
 
 
@@ -464,14 +555,16 @@ def run_neurochemical_simulation(
 
     chem_names = ['dopamine', 'serotonin', 'cortisol',
                   'oxytocin', 'norepinephrine', 'acetylcholine']
-    mod_names  = ['stdp_scale', 'learning_gate',
-                  'health_decay_mod', 'global_gain', 'memory_gate']
+    mod_names  = ['stdp_scale', 'learning_gate', 'health_decay_mod',
+                  'global_gain', 'memory_gate',
+                  'dopamine_motor_bias', 'oxytocin_stg_scale',
+                  'serotonin_amygdala_mod', 'vocalization_drive']
 
     traces = {name: np.empty(N) for name in chem_names}
     mods   = {name: np.empty(N) for name in mod_names}
 
     print("=" * 70)
-    print("CAINE - Module 3: Neurochemical System")
+    print("CAINE - Module 4: Neurochemical System")
     print("=" * 70)
     print(f"  Duration  : {duration_ms:.0f} ms  |  dt={dt_ms} ms")
     print(f"  Events    : {len(schedule)} scripted events")
@@ -498,11 +591,15 @@ def run_neurochemical_simulation(
             traces[name][i] = snap[name]
 
         # Record modulation outputs
-        mods['stdp_scale'][i]       = system.stdp_scale()
-        mods['learning_gate'][i]    = system.learning_gate()
-        mods['health_decay_mod'][i] = system.health_decay_mod()
-        mods['global_gain'][i]      = system.global_gain()
-        mods['memory_gate'][i]      = system.memory_gate()
+        mods['stdp_scale'][i]             = system.stdp_scale()
+        mods['learning_gate'][i]          = system.learning_gate()
+        mods['health_decay_mod'][i]       = system.health_decay_mod()
+        mods['global_gain'][i]            = system.global_gain()
+        mods['memory_gate'][i]            = system.memory_gate()
+        mods['dopamine_motor_bias'][i]    = system.dopamine_motor_bias()
+        mods['oxytocin_stg_scale'][i]     = system.oxytocin_stg_scale()
+        mods['serotonin_amygdala_mod'][i] = system.serotonin_amygdala_mod()
+        mods['vocalization_drive'][i]     = system.vocalization_drive()
 
     # -----------------------------------------------------------------------
     # 6.4  Summary
@@ -553,7 +650,7 @@ def plot_neurochemical(t, traces, mods, schedule):
     # Figure 1: Chemical concentrations
     # -----------------------------------------------------------------
     fig1, axes1 = plt.subplots(3, 2, figsize=(14, 10), sharex=True)
-    fig1.suptitle("CAINE - Module 3: Neurochemical Concentrations",
+    fig1.suptitle("CAINE - Module 4: Neurochemical Concentrations",
                   fontsize=12, fontweight='bold')
 
     ax_flat = axes1.flatten()
@@ -578,28 +675,36 @@ def plot_neurochemical(t, traces, mods, schedule):
         ax.set_xlabel('Time (s)')
 
     plt.tight_layout()
-    fig1.savefig(os.path.join(_OUTPUT_DIR, 'caine_module3_chemicals.png'), dpi=150, bbox_inches='tight')
-    print('[NEURO] Plot saved -> output/caine_module3_chemicals.png')
+    fig1.savefig(os.path.join(_OUTPUT_DIR, 'caine_module4_chemicals.png'), dpi=150, bbox_inches='tight')
+    print('[NEURO] Plot saved -> output/caine_module4_chemicals.png')
 
     # -----------------------------------------------------------------
     # Figure 2: Modulation outputs
     # -----------------------------------------------------------------
     mod_layout = [
-        ('stdp_scale',       'STDP Scale Factor',
-         '(1.0=baseline)  DA + ACh + OT combined', 'purple', [0.0, 3.0]),
-        ('learning_gate',    'Learning Gate (ACh)',
+        ('stdp_scale',            'STDP Scale (global)',
+         'DA + ACh + OT -- all cortical regions', 'purple', [0.0, 3.0]),
+        ('learning_gate',         'Learning Gate (ACh)',
          'STDP suppressed below ~0.5', 'steelblue', [-0.05, 1.05]),
-        ('health_decay_mod', 'Health Decay Modifier',
+        ('health_decay_mod',      'Health Decay Modifier',
          '>1 = slower pruning (5HT), <1 = faster pruning (CORT)', 'goldenrod', [0.0, 5.0]),
-        ('global_gain',      'Global Gain (NE)',
+        ('global_gain',           'Global Gain (NE)',
          'Multiplier on neuron excitability', 'darkorange', [0.4, 3.1]),
-        ('memory_gate',      'Memory Gate (CA1 encoding)',
+        ('memory_gate',           'Memory Gate (CA1 encoding)',
          'Suppressed by high cortisol', 'tomato', [-0.05, 1.05]),
+        ('dopamine_motor_bias',   'Dopamine Motor Bias',
+         '0.5=neutral, >0.5=approach, <0.5=withdrawal', 'royalblue', [0.0, 1.05]),
+        ('oxytocin_stg_scale',    'OT-STG STDP Scale',
+         'Targeted OT boost for STG / social regions', 'orchid', [0.0, 4.1]),
+        ('serotonin_amygdala_mod','5HT Amygdala Damping',
+         '<1.0 = reduced amygdala reactivity', 'mediumseagreen', [0.0, 1.05]),
+        ('vocalization_drive',    'Vocalization Drive (OT)',
+         'OT-driven boost to mouth motor region', 'orchid', [-0.05, 1.05]),
     ]
 
-    fig2, axes2 = plt.subplots(len(mod_layout), 1, figsize=(14, 11),
+    fig2, axes2 = plt.subplots(len(mod_layout), 1, figsize=(14, 18),
                                sharex=True)
-    fig2.suptitle("CAINE - Module 3: Neurochemical Modulation Outputs",
+    fig2.suptitle("CAINE - Module 4: Neurochemical Modulation Outputs",
                   fontsize=12, fontweight='bold')
 
     for ax, (key, title, subtitle, color, ylim) in zip(axes2, mod_layout):
@@ -627,8 +732,8 @@ def plot_neurochemical(t, traces, mods, schedule):
 
     axes2[-1].set_xlabel('Time (s)')
     plt.tight_layout()
-    fig2.savefig(os.path.join(_OUTPUT_DIR, 'caine_module3_modulation.png'), dpi=150, bbox_inches='tight')
-    print('[NEURO] Plot saved -> output/caine_module3_modulation.png')
+    fig2.savefig(os.path.join(_OUTPUT_DIR, 'caine_module4_modulation.png'), dpi=150, bbox_inches='tight')
+    print('[NEURO] Plot saved -> output/caine_module4_modulation.png')
 
     plt.show()
 

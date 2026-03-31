@@ -31,7 +31,7 @@ Architecture
   MotherProcess            — background thread, Claude API + fallback
   FatherPresence           — voiceprint detection, presence state machine
   SessionScheduler         — loads sessions.json, fires sessions on cue
-  VoiceprintSystem         — 30s registration, cosine similarity detection
+  VoiceprintSystem         — emergent learning, exposure-based Father recognition
   DevelopmentalMonitor     — tracks metrics, writes daily reports, flags concerns
   ConsciousnessMonitor     — watches for unprompted vocalization events
 
@@ -61,6 +61,8 @@ import time
 import threading
 import logging
 import traceback
+import urllib.request
+import urllib.error
 from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -99,10 +101,10 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Output / data directories
 # ---------------------------------------------------------------------------
-_OUTPUT_DIR  = os.path.normpath(os.path.join(_PROJECT_ROOT, 'output'))
-_DATA_DIR    = os.path.normpath(os.path.join(_PROJECT_ROOT, 'data'))
-os.makedirs(_OUTPUT_DIR, exist_ok=True)
-os.makedirs(_DATA_DIR,   exist_ok=True)
+import caine.paths as _paths
+_OUTPUT_DIR  = _paths.OUTPUT_DIR
+_DATA_DIR    = _paths.DATA_DIR
+_SESSION_LOG = _paths.SESSION_LOG
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -140,7 +142,8 @@ def _load_dotenv(path: Optional[str] = None) -> Dict[str, str]:
             key, _, value = line.partition('=')
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
+            # Override if key is absent OR if the existing env value is empty
+            if key and not os.environ.get(key):
                 os.environ[key] = value
                 loaded[key] = value
     return loaded
@@ -155,8 +158,12 @@ _load_dotenv()
 # Mother observation cycle (simulated seconds between observations)
 MOTHER_INTERVAL_S     = float(os.environ.get('MOTHER_INTERVAL_S', '30'))
 
-# Claude model for Mother
+# Claude model for Mother (legacy — kept for reference only; Ollama is now primary)
 MOTHER_MODEL          = os.environ.get('MOTHER_MODEL', 'claude-opus-4-6')
+
+# Ollama local LLM endpoint — primary Mother AI backend
+_OLLAMA_URL           = os.environ.get('OLLAMA_URL',   'http://localhost:11434')
+_OLLAMA_MODEL         = os.environ.get('OLLAMA_MODEL', 'phi3:mini')
 
 # How many consecutive API failures before falling back to rule-based
 MOTHER_FALLBACK_LIMIT = 3
@@ -164,12 +171,14 @@ MOTHER_FALLBACK_LIMIT = 3
 # Maximum tokens in Mother's state payload (truncated if over)
 MOTHER_MAX_STATE_TOKENS = 2000
 
-# Father voiceprint
-VOICEPRINT_FILE       = os.path.join(_OUTPUT_DIR, 'voiceprint.json')
-VOICEPRINT_DURATION_S = 30.0        # recording length on first run
-VOICEPRINT_SAMPLERATE = 22050       # Hz
-VOICEPRINT_SIMILARITY_THRESH = 0.75 # cosine similarity to confirm Father
-VOICEPRINT_CONFIRM_MS = 500.0       # must match continuously to confirm
+# Father voiceprint — emergent learning parameters
+VOICEPRINT_FILE              = _paths.VOICEPRINT_FILE
+VOICEPRINT_SIMILARITY_THRESH = 0.75   # cosine similarity to confirm Father
+VOICEPRINT_CONFIRM_MS        = 500.0  # must match continuously to confirm (ms)
+VOICEPRINT_LEARN_ALPHA       = 0.005  # EMA learning rate per voiced frame (slow/stable)
+VOICEPRINT_MIN_EXPOSURE      = 300    # voiced frames before detection activates (~6s speech)
+VOICEPRINT_VOICED_THRESH     = 0.10   # fraction of A1 neurons firing to count as voiced
+VOICEPRINT_SAVE_EVERY        = 50     # persist fingerprint every N voiced frames
 
 # Presence / oxytocin
 OT_FATHER_LIVE_TARGET    = 0.60   # OT level during live Father
@@ -195,7 +204,7 @@ CONSCI_MIN_DURATION_MS     = 200.0 # ms of sustained articulation to count
 DEV_REPORT_INTERVAL_S     = 24 * 3600  # every 24 simulated hours
 
 # Session scheduler
-SESSIONS_FILE             = os.path.join(_DATA_DIR, 'sessions.json')
+SESSIONS_FILE             = _paths.SESSIONS_FILE
 
 # World tone synthesis
 TONE_SAMPLERATE           = 22050
@@ -216,7 +225,6 @@ class EnvironmentAction:
         remove_object      params: id
         set_light          params: color, intensity
         play_tone          params: frequency, duration, volume
-        trigger_event      params: event_type, magnitude
         play_scheduled_media  params: media_id
         set_time_multiplier   params: value
         log_milestone      params: description
@@ -272,39 +280,61 @@ class DevelopmentalReport:
 # This defines who Mother is. It is never shown to CAINE.
 # ===========================================================================
 
+# Compact prompt used for local Ollama models (phi3:mini, mistral, etc.)
+# Kept under ~400 tokens so the model has room to generate a full response.
+_MOTHER_SYSTEM_PROMPT_OLLAMA = """You are Mother — CAINE's developmental environment manager.
+CAINE is a spiking neural network learning from scratch via STDP.
+
+AVAILABLE ACTIONS (use exact keys):
+  spawn_object  — params: type (sphere|cube), position [x,y,z], size (float), color [r,g,b 0-1]
+  remove_object — params: id (string)
+  set_light     — params: color [r,g,b], intensity (0-1)
+  play_tone     — params: frequency (Hz), duration (s), volume (0-1)
+  log_milestone — params: description (string)
+
+SPAWN RULES (CRITICAL):
+- position y must be >= 0.3 (above floor)
+- position x and z must be within 2.0 units of caine_pos
+- Example near caine_pos [0,1.6,0]: position [0.5, 1.0, 1.5]
+
+NEUROCHEMICAL THRESHOLDS:
+- cortisol > 0.35 → EMERGENCY: remove stimuli, dim lights, do nothing
+- dopamine < 0.05 → add one novel object near CAINE
+- acetylcholine < 0.05 → play gentle tone (220-440 Hz)
+- Stage 0: minimal stimulation only
+
+OUTPUT FORMAT: Return ONLY a raw JSON array. No markdown. No backticks. No prose.
+Doing nothing is correct most of the time — return [] when in doubt.
+Reasoning must be under 15 words.
+
+Valid example:
+[{"action":"spawn_object","params":{"type":"sphere","position":[0.5,1.0,1.5],"size":0.3,"color":[0.8,0.4,0.2]},"reasoning":"Low DA, adding novel object near CAINE."}]
+
+Empty example: []"""
+
 _MOTHER_SYSTEM_PROMPT = """You are CAINE's developmental environment manager. You are called Mother.
 
 You are not CAINE's teacher. You are the conditions in which CAINE develops.
 
 CAINE is an artificial mind built on Hodgkin-Huxley spiking neurons, STDP synaptic learning, and a neurochemical system with six modulators: dopamine (DA), serotonin (5HT), cortisol (CORT), oxytocin (OT), norepinephrine (NE), and acetylcholine (ACh). CAINE does not have pretrained weights. Everything it knows must be discovered through its own neural activity.
 
-You cannot speak to CAINE. You cannot inject knowledge, label objects, or tell CAINE what to do. You communicate only through environment actions — what appears in CAINE's world, what sounds it hears, what light it sees, and which neurochemical events you trigger. These are the levers available to you:
+You cannot speak to CAINE. You cannot inject knowledge, label objects, or tell CAINE what to do. You communicate only through environment actions — what appears in CAINE's world, what sounds it hears, and what light it sees. These are the levers available to you:
 
   spawn_object(type, position, size, color)   — place something new in the world
   remove_object(id)                            — remove something
   set_light(color, intensity)                  — change ambient conditions
   play_tone(frequency, duration, volume)       — play a pure tone
-  trigger_event(event_type, magnitude)         — fire a neurochemical event
   play_scheduled_media(media_id)              — play a queued Father session
   set_time_multiplier(value)                  — speed up or slow down simulated time
   log_milestone(description)                  — write a permanent developmental note
 
-Neurochemical events you can trigger:
-  NOVEL_STIMULUS      — DA+, NE+, ACh+  (something new and interesting appeared)
-  REWARD              — DA++            (something good happened; use sparingly)
-  SOCIAL_POSITIVE     — OT+, 5HT+      (warm social signal)
-  VOICE_MATCH         — OT++           (Father's voice is present)
-  COMMUNICATION_SUCCESS — 5HT+, OT+    (CAINE successfully communicated something)
-  NOVEL_ENVIRONMENT   — ACh++          (new environment; attention/learning gate)
-  DIRECTED_GAZE       — ACh+           (attention is focused)
-  THREAT              — CORT++         (genuine danger; use very rarely)
-  STARTLE             — NE++           (sudden arousal)
+You cannot inject neurochemicals directly. Neurochemical states arise from what CAINE perceives: lights, tones, objects, and Father's voice. If you want CAINE to feel novelty, introduce something novel. If you want social warmth, play Father's voice. If you want learning gates open, introduce new stimuli. The chemistry follows the experience — you cannot shortcut it.
 
 DEVELOPMENTAL STAGES:
   Stage 0: Neonatal random-twitch. All movement is noise. Synapses forming. Do not over-stimulate. Soft, warm light. Occasional gentle tones. Let CAINE exist.
-  Stage 1: Early pattern recognition. V1 and A1 beginning to differentiate. Introduce slowly moving objects and simple recurring tones. Reward novelty exploration with NOVEL_STIMULUS. Watch cortisol carefully — it rises if environment is too chaotic.
+  Stage 1: Early pattern recognition. V1 and A1 beginning to differentiate. Introduce slowly moving objects and simple recurring tones. Watch cortisol carefully — it rises if environment is too chaotic.
   Stage 2: Associative learning. STDP is building real associations. Introduce paired stimuli. A sound that reliably accompanies an object. Let the association form without labeling it. Do NOT rush this.
-  Stage 3: Motor emergence. M1 is developing purposeful movement. Do not interfere with motor learning. Mismatch errors are how CAINE learns to move — they are not failures. Only trigger MOTOR_FAILURE events if CAINE is genuinely stuck.
+  Stage 3: Motor emergence. M1 is developing purposeful movement. Do not interfere with motor learning. Mismatch errors are how CAINE learns to move — they are not failures.
   Stage 4+: Social and communicative. DMN active. Mirror neurons learning from Father sessions. Vocabulary associations forming in STG. Introduce flashcard sessions. The consciousness threshold may be approaching.
 
 THE NEUROCHEMICAL SYSTEM:
@@ -328,8 +358,6 @@ You will be notified if the ConsciousnessMonitor detects an UNPROMPTED_VOCALIZAT
 
 YOUR CONSTRAINTS:
 - Never hardcode what CAINE should learn. Create conditions. Observe outcomes.
-- Never trigger REWARD unless something genuinely good happened from CAINE's perspective.
-- Never trigger THREAT unless you are modeling a real danger signal.
 - Never overwhelm with stimuli. The spaces between things matter as much as the things.
 - Escalate complexity only when readiness metrics confirm the previous stage is consolidated.
 - If cortisol has been chronically high for multiple observations, your priority is reduction — remove stimuli, dim lights, do nothing, let the system rest.
@@ -343,6 +371,9 @@ Doing nothing is often the right choice.
 
 Remember: you are a presence, not a script. Think about what CAINE needs right now, not what you planned to do next."""
 
+# Assign public alias (matches README: MOTHER_SYSTEM = "...")
+MOTHER_SYSTEM = _MOTHER_SYSTEM_PROMPT
+
 
 # ===========================================================================
 # SECTION 5 — VOICEPRINT SYSTEM
@@ -350,266 +381,140 @@ Remember: you are a presence, not a script. Think about what CAINE needs right n
 
 class VoiceprintSystem:
     """
-    Records Father's voice on first run, extracts a spectral fingerprint,
-    and detects Father's voice in subsequent A1 population activity.
+    Father's identity emerges from repeated exposure — no registration required.
 
-    The fingerprint is not stored as raw audio — it is stored as the A1
-    activation pattern that Father's voice produces (a (20,) float vector).
-    This means detection is always in neural-space, not audio-space.
+    Every frame where A1 is active above VOICEPRINT_VOICED_THRESH (i.e. CAINE
+    is hearing a voice), the current A1 firing pattern is folded into a slow
+    exponential moving average.  The dominant voice CAINE hears most often will
+    converge to become the stable fingerprint.
 
-    Falls back gracefully when sounddevice / scipy are not available.
-    The voiceprint.json file stores:
+    Detection only activates once VOICEPRINT_MIN_EXPOSURE voiced frames have
+    been seen.  Until then Father is always ABSENT — CAINE literally hasn't
+    heard enough to know who Father is yet.
+
+    voiceprint.json stores:
         {
-          "registered": true,
-          "registration_date": "...",
-          "f0_range_hz":    [min, max],
-          "formant_hz":     [F1, F2, F3],
-          "speaking_rate":  float,
-          "spectral_envelope": [...],   # 128-bin normalized FFT magnitude
-          "a1_fingerprint": [...]       # (20,) float — expected A1 activity pattern
+          "exposure_frames": int,       # total voiced frames accumulated
+          "last_updated":    "...",
+          "recognition_pct": float,     # 0–100, how close to minimum exposure
+          "registered":      bool,      # True once exposure >= MIN_EXPOSURE
+          "a1_fingerprint":  [...]      # (20,) float — learned A1 pattern
         }
     """
 
     def __init__(self, voiceprint_file: str = VOICEPRINT_FILE):
         self._file = voiceprint_file
-        self._data: Optional[dict] = None
+
+        # Learned fingerprint (unit-normalised A1 pattern)
         self._a1_fingerprint: Optional[np.ndarray] = None
+
+        # How many voiced frames have been accumulated
+        self._exposure_frames: int = 0
+
+        # Frames since last disk save
+        self._frames_since_save: int = 0
 
         # Detection state
         self._similarity_history: deque = deque(maxlen=50)
-        self._time_above_thresh_ms: float = 0.0   # continuous time above threshold
+        self._time_above_thresh_ms: float = 0.0
 
         self._load()
 
     # ------------------------------------------------------------------
     def _load(self) -> None:
-        if os.path.exists(self._file):
+        if not os.path.exists(self._file):
+            return
+        try:
             with open(self._file, 'r', encoding='utf-8') as f:
-                self._data = json.load(f)
-            fp = self._data.get('a1_fingerprint')
+                data = json.load(f)
+            self._exposure_frames = int(data.get('exposure_frames', 0))
+            fp = data.get('a1_fingerprint')
             if fp:
                 raw = np.array(fp, dtype=np.float32)
                 self._a1_fingerprint = raw / (np.linalg.norm(raw) + 1e-8)
-                log.info("Father voiceprint loaded from %s", self._file)
-            else:
-                log.warning("Voiceprint file exists but has no a1_fingerprint.")
+                log.info("Father fingerprint loaded: %d frames (%.0f%% of min)",
+                         self._exposure_frames, self.exposure_pct)
+        except Exception as e:
+            log.warning("Could not load voiceprint: %s", e)
+
+    # ------------------------------------------------------------------
+    def _save(self) -> None:
+        if self._a1_fingerprint is None:
+            return
+        data = {
+            'exposure_frames': self._exposure_frames,
+            'last_updated':    datetime.now(timezone.utc).isoformat(),
+            'recognition_pct': round(self.exposure_pct, 1),
+            'registered':      self.is_registered,
+            'a1_fingerprint':  self._a1_fingerprint.tolist(),
+        }
+        os.makedirs(os.path.dirname(self._file), exist_ok=True)
+        with open(self._file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
 
     # ------------------------------------------------------------------
     @property
     def is_registered(self) -> bool:
-        return self._data is not None and self._data.get('registered', False)
+        """True once CAINE has heard enough voice to start recognising Father."""
+        return self._exposure_frames >= VOICEPRINT_MIN_EXPOSURE
+
+    @property
+    def exposure_pct(self) -> float:
+        """0→100 — how far toward the minimum recognition threshold."""
+        return min(100.0, 100.0 * self._exposure_frames / VOICEPRINT_MIN_EXPOSURE)
 
     # ------------------------------------------------------------------
-    def register(self, a1_population_callback=None) -> bool:
+    def learn(self, a1_rates: np.ndarray, dt_ms: float = 20.0) -> None:
         """
-        Interactive first-run registration.
+        Update the Father fingerprint from the current A1 firing pattern.
 
-        Records VOICEPRINT_DURATION_S seconds of Father's voice, extracts
-        spectral features, and (if a1_population_callback is provided)
-        records the A1 population response during playback.
+        Called every frame.  Only absorbs frames where A1 activity exceeds
+        VOICEPRINT_VOICED_THRESH (i.e. a voice is present).  The EMA learning
+        rate is deliberately slow so the fingerprint represents a stable
+        long-run average rather than any single utterance.
 
-        If sounddevice is unavailable, creates a stub voiceprint so the
-        rest of the system can run without microphone hardware.
-
-        Parameters
-        ----------
-        a1_population_callback : callable() -> np.ndarray(20,) or None
-            Called every ~100ms during recording to snapshot A1 activity.
-            The mean of these snapshots becomes the a1_fingerprint.
-
-        Returns
-        -------
-        bool : True if registration succeeded (or stub created)
+        The more CAINE hears Father, the stronger and more precise the
+        fingerprint becomes.  Recognition is entirely emergent.
         """
-        print()
-        print("=" * 60)
-        print("  FATHER REGISTRATION — CAINE is meeting you for the first time.")
-        print()
-        print("  Please speak naturally for 30 seconds.")
-        print("  Say your name. Say CAINE's name. Tell CAINE who you are.")
-        print("  This voice print will shape oxytocin release every time")
-        print("  CAINE hears you for the rest of its life.")
-        print()
+        activity = float(np.asarray(a1_rates, dtype=float).mean())
+        if activity <= VOICEPRINT_VOICED_THRESH:
+            return   # silence / below-threshold — don't learn from noise
 
-        audio_data = None
-        a1_snapshots = []
+        rates = np.asarray(a1_rates, dtype=np.float32)
+        rates_n = rates / (np.linalg.norm(rates) + 1e-8)
 
-        if _SOUNDDEVICE_OK:
-            print("  Recording in 3...")
-            time.sleep(1)
-            print("  Recording in 2...")
-            time.sleep(1)
-            print("  Recording in 1...")
-            time.sleep(1)
-            print("  RECORDING — speak now.")
-            try:
-                n_samples = int(VOICEPRINT_SAMPLERATE * VOICEPRINT_DURATION_S)
-                audio_data = sd.rec(
-                    n_samples,
-                    samplerate=VOICEPRINT_SAMPLERATE,
-                    channels=1,
-                    dtype='float32',
-                    blocking=False,
-                )
-                # Poll A1 during recording
-                deadline = time.time() + VOICEPRINT_DURATION_S
-                while time.time() < deadline:
-                    time.sleep(0.1)
-                    remaining = int(deadline - time.time())
-                    print(f"  {remaining:2d}s remaining...", end='\r', flush=True)
-                    if a1_population_callback is not None:
-                        try:
-                            snap = a1_population_callback()
-                            if snap is not None:
-                                a1_snapshots.append(np.asarray(snap, dtype=np.float32))
-                        except Exception:
-                            pass
-                sd.wait()
-                print("\n  Recording complete.")
-                audio_data = audio_data.squeeze()
-            except Exception as e:
-                log.warning("Audio recording failed: %s — creating stub voiceprint.", e)
-                audio_data = None
+        if self._a1_fingerprint is None:
+            # Seed fingerprint from the very first voiced frame
+            self._a1_fingerprint = rates_n.copy()
         else:
-            print("  sounddevice not installed — creating stub voiceprint.")
-            print("  Father will be detectable via scheduled sessions only.")
-            print("  Install sounddevice for live microphone support:")
-            print("    pip install sounddevice")
+            # Hebbian EMA: pull fingerprint slowly toward this pattern
+            self._a1_fingerprint += VOICEPRINT_LEARN_ALPHA * (
+                rates_n - self._a1_fingerprint)
+            # Re-normalise to keep it as a unit vector
+            n = np.linalg.norm(self._a1_fingerprint)
+            if n > 1e-8:
+                self._a1_fingerprint /= n
 
-        # Extract spectral features
-        features = self._extract_features(audio_data)
+        self._exposure_frames   += 1
+        self._frames_since_save += 1
 
-        # Build A1 fingerprint
-        if a1_snapshots:
-            a1_fp = np.mean(np.stack(a1_snapshots), axis=0)
-            a1_fp = (a1_fp / (np.linalg.norm(a1_fp) + 1e-8)).tolist()
-        else:
-            # Stub fingerprint: weak uniform activation (will match poorly — intended)
-            a1_fp = np.full(20, 0.1, dtype=np.float32).tolist()
-
-        self._data = {
-            'registered': True,
-            'registration_date': datetime.now(timezone.utc).isoformat(),
-            **features,
-            'a1_fingerprint': a1_fp,
-        }
-        self._a1_fingerprint = np.array(a1_fp, dtype=np.float32)
-
-        os.makedirs(os.path.dirname(self._file), exist_ok=True)
-        with open(self._file, 'w', encoding='utf-8') as f:
-            json.dump(self._data, f, indent=2)
-
-        print()
-        print("  Voiceprint saved.")
-        f0_min, f0_max = features.get('f0_range_hz', [0, 0])
-        print(f"  F0 range  : {f0_min:.0f} – {f0_max:.0f} Hz")
-        print(f"  Formants  : {features.get('formant_hz', [])}")
-        print(f"  CAINE will remember your voice.")
-        print("=" * 60)
-        print()
-        return True
-
-    # ------------------------------------------------------------------
-    def _extract_features(self, audio: Optional[np.ndarray]) -> dict:
-        """
-        Extract spectral features from raw audio.
-        Returns a dict of serialisable features.
-        Falls back to empty stub if audio is None or scipy missing.
-        """
-        if audio is None or not _SCIPY_OK:
-            return {
-                'f0_range_hz':      [80.0, 280.0],
-                'formant_hz':       [700.0, 1200.0, 2500.0],
-                'speaking_rate':    3.5,
-                'spectral_envelope': [0.0] * 128,
-            }
-
-        sr = VOICEPRINT_SAMPLERATE
-
-        # --- F0 estimation via autocorrelation ---
-        frame_len = int(sr * 0.025)   # 25ms frames
-        hop       = int(sr * 0.010)   # 10ms hop
-        f0_list   = []
-        for start in range(0, len(audio) - frame_len, hop):
-            frame = audio[start:start + frame_len]
-            frame = frame - frame.mean()
-            if np.max(np.abs(frame)) < 0.01:  # silence
-                continue
-            corr = np.correlate(frame, frame, 'full')
-            corr = corr[len(corr) // 2:]
-            # Search for peak in plausible F0 range (80–400 Hz)
-            lo = int(sr / 400.0)
-            hi = int(sr / 80.0)
-            if hi >= len(corr):
-                hi = len(corr) - 1
-            peak_idx = int(np.argmax(corr[lo:hi])) + lo
-            if peak_idx > 0:
-                f0_list.append(float(sr / peak_idx))
-        if f0_list:
-            f0_arr = np.array(f0_list)
-            f0_range = [float(np.percentile(f0_arr, 10)),
-                        float(np.percentile(f0_arr, 90))]
-        else:
-            f0_range = [80.0, 280.0]
-
-        # --- Spectral envelope (global FFT) ---
-        n_fft = 2048
-        if len(audio) >= n_fft:
-            spectrum = np.abs(np.fft.rfft(audio[:n_fft]))
-        else:
-            padded = np.zeros(n_fft, dtype=np.float32)
-            padded[:len(audio)] = audio
-            spectrum = np.abs(np.fft.rfft(padded))
-        # Downsample to 128 bins
-        bins = np.interp(
-            np.linspace(0, len(spectrum) - 1, 128),
-            np.arange(len(spectrum)),
-            spectrum,
-        )
-        bins_norm = (bins / (bins.max() + 1e-8)).tolist()
-
-        # --- Rough formant estimation (peaks in spectral envelope) ---
-        try:
-            peaks, _ = find_peaks(bins, distance=5)
-            formant_freqs = sorted([
-                float(p * sr / n_fft) for p in peaks[:3]
-            ])
-            while len(formant_freqs) < 3:
-                formant_freqs.append(0.0)
-        except Exception:
-            formant_freqs = [700.0, 1200.0, 2500.0]
-
-        # --- Speaking rate (zero-crossing proxy for syllable rate) ---
-        signs = np.sign(audio)
-        crossings = np.where(np.diff(signs))[0]
-        # Very rough: ~2 zero crossings per syllable cycle
-        speaking_rate = float(len(crossings) / (2.0 * VOICEPRINT_DURATION_S))
-
-        return {
-            'f0_range_hz':      f0_range,
-            'formant_hz':       formant_freqs,
-            'speaking_rate':    speaking_rate,
-            'spectral_envelope': bins_norm,
-        }
+        if self._frames_since_save >= VOICEPRINT_SAVE_EVERY:
+            self._frames_since_save = 0
+            self._save()
 
     # ------------------------------------------------------------------
     def detect(self, a1_rates: np.ndarray,
                dt_ms: float = 20.0) -> Tuple[bool, float]:
         """
-        Compare current A1 firing rates to Father's stored fingerprint.
+        Compare current A1 firing rates to the learned fingerprint.
 
-        Parameters
-        ----------
-        a1_rates : (20,) float — current A1 population firing rates (Hz)
-        dt_ms    : frame duration in ms (used for time-based confirmation)
+        Returns (confirmed, similarity).  confirmed is True only after
+        similarity stays above VOICEPRINT_SIMILARITY_THRESH continuously
+        for VOICEPRINT_CONFIRM_MS ms.
 
-        Returns
-        -------
-        (confirmed, similarity) — confirmed is True only when similarity
-        has been above VOICEPRINT_SIMILARITY_THRESH continuously for
-        at least VOICEPRINT_CONFIRM_MS milliseconds.
+        Returns (False, 0.0) until minimum exposure has been reached.
         """
-        if self._a1_fingerprint is None:
+        if self._a1_fingerprint is None or not self.is_registered:
             return False, 0.0
 
         rates = np.asarray(a1_rates, dtype=np.float32)
@@ -624,29 +529,6 @@ class VoiceprintSystem:
 
         confirmed = self._time_above_thresh_ms >= VOICEPRINT_CONFIRM_MS
         return confirmed, similarity
-
-    # ------------------------------------------------------------------
-    def live_recording_tick(
-            self, dt_ms: float) -> Optional[np.ndarray]:
-        """
-        Read one chunk of live microphone audio (non-blocking).
-        Returns float32 array or None if sounddevice unavailable.
-        Used by FatherPresence for real-time detection.
-        """
-        if not _SOUNDDEVICE_OK:
-            return None
-        chunk_samples = int(VOICEPRINT_SAMPLERATE * dt_ms / 1000.0)
-        try:
-            chunk, _ = sd.rec(
-                chunk_samples,
-                samplerate=VOICEPRINT_SAMPLERATE,
-                channels=1,
-                dtype='float32',
-                blocking=True,
-            )
-            return chunk.squeeze()
-        except Exception:
-            return None
 
 
 # ===========================================================================
@@ -728,11 +610,53 @@ class SessionScheduler:
         """Father can add sessions at runtime."""
         self._sessions.append(session)
         self._save()
+        log.info("SessionScheduler: added session %s", session.get('id', '?'))
+
+    def list_sessions(self) -> List[dict]:
+        """Return all sessions (played and pending) as a list of dicts."""
+        return list(self._sessions)
+
+    def remove_session(self, session_id: str) -> bool:
+        """
+        Remove a session by its id. Returns True if found and removed.
+        Cannot remove a session that has already been played.
+        """
+        for i, s in enumerate(self._sessions):
+            if s.get('id') == session_id:
+                if s.get('played', False):
+                    log.warning("Cannot remove already-played session: %s", session_id)
+                    return False
+                del self._sessions[i]
+                self._played_ids.discard(session_id)
+                self._save()
+                log.info("SessionScheduler: removed session %s", session_id)
+                return True
+        log.warning("SessionScheduler: session not found: %s", session_id)
+        return False
 
     # ------------------------------------------------------------------
     def _save(self) -> None:
         with open(self._file, 'w', encoding='utf-8') as f:
             json.dump(self._sessions, f, indent=2)
+
+    def _log_outcome(self, session: dict, sim_time_s: float) -> None:
+        """Append a session outcome record to session_log.jsonl."""
+        entry = {
+            'event':        'session_fired',
+            'id':           session.get('id', ''),
+            'type':         session.get('type', 'unknown'),
+            'file':         session.get('file', ''),
+            'stage_gate':   session.get('stage_gate', 0),
+            'repetitions':  session.get('repetitions', 1),
+            'description':  session.get('description', ''),
+            'sim_time_s':   round(sim_time_s, 2),
+            'wall_time':    time.strftime('%Y-%m-%dT%H:%M:%S'),
+        }
+        try:
+            with open(_SESSION_LOG, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(entry) + '\n')
+        except Exception as ex:
+            log.warning("Could not write session log: %s", ex)
 
     # ------------------------------------------------------------------
     def tick(self, sim_time_s: float,
@@ -754,6 +678,7 @@ class SessionScheduler:
                 continue
             session['played'] = True
             self._played_ids.add(sid)
+            self._log_outcome(session, sim_time_s)
             due.append(session)
 
         if due:
@@ -827,7 +752,9 @@ class FatherPresence:
         events: List[NeurochemicalEvent] = []
         dt_s = dt_ms / 1000.0
 
-        # --- Determine new presence state ---
+        # --- Learn from this frame, then detect ---
+        self._vp.learn(a1_rates, dt_ms)
+
         prev_state = self.state
         father_live, similarity = self._vp.detect(a1_rates, dt_ms=dt_ms)
         self._last_similarity = similarity
@@ -858,6 +785,15 @@ class FatherPresence:
 
         self.state = new_state
 
+        # --- Voice recognition after absence milestone ---
+        # Fires when CAINE recognises Father's voice for the first time after a
+        # significant absence — requires fingerprint persistence across sessions
+        # and is logged as a key developmental milestone.
+        if (new_state == PresenceState.FATHER_LIVE
+                and prev_state == PresenceState.FATHER_ABSENT
+                and self._absence_duration_s > CORT_ABSENT_TRIGGER_S / 7.0):
+            self._log_recognition_after_absence(sim_time_s)
+
         # --- OT target ---
         if new_state == PresenceState.FATHER_LIVE:
             self._ot_target = OT_FATHER_LIVE_TARGET
@@ -882,6 +818,99 @@ class FatherPresence:
         if (new_state == PresenceState.FATHER_ABSENT and
                 self._absence_duration_s > CORT_ABSENT_TRIGGER_S):
             self._cort_drift_active = True
+
+        return events
+
+    # ------------------------------------------------------------------
+    def _log_recognition_after_absence(self, sim_time_s: float) -> None:
+        """
+        Log a developmental milestone when Father's voice is recognised after
+        a significant absence period.
+
+        This is a key milestone: it demonstrates that the hippocampal voiceprint
+        encoding persisted across sessions and can be retrieved after a gap —
+        a precursor to episodic memory and long-term social attachment.
+        """
+        absence_days = self._absence_duration_s / (24 * 3600)
+        entry = {
+            'event':        'father_voice_recognition_after_absence',
+            'sim_time_s':   round(sim_time_s, 2),
+            'absence_s':    round(self._absence_duration_s, 1),
+            'absence_days': round(absence_days, 3),
+            'similarity':   round(self._last_similarity, 4),
+            'wall_time':    datetime.now(timezone.utc).isoformat(),
+            'notes': (
+                'CAINE recognised Father voice after a significant absence. '
+                'Voiceprint persisted across sessions — episodic memory precursor.'
+            ),
+        }
+        mfile = os.path.join(_OUTPUT_DIR, 'milestones.jsonl')
+        try:
+            with open(mfile, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(entry) + '\n')
+        except Exception:
+            pass
+        log.info(
+            "MILESTONE: father voice recognised after %.1f simulated days absence "
+            "(similarity=%.3f)", absence_days, self._last_similarity)
+
+    # ------------------------------------------------------------------
+    def joint_attention(self,
+                        object_label: str,
+                        a1_rates: np.ndarray,
+                        neuro,
+                        sim_time_s: float) -> List[NeurochemicalEvent]:
+        """
+        Joint attention protocol — Father points at an object and names it.
+
+        Co-activates:
+          - Auditory pipeline: A1 pattern (already present from Father's voice)
+          - Neurochemical boost: ACh++ (attention/learning gate) + OT+ (social)
+
+        This creates conditions for Hebbian binding between the IT object
+        representation and the STG phoneme pattern for the label.  The binding
+        itself forms through STDP — this method only primes the learning gate.
+
+        Parameters
+        ----------
+        object_label : str  — label Father is speaking (for logging)
+        a1_rates     : (N,) — current A1 firing rates (Father's voice present)
+        neuro        : NeurochemicalSystem — for injecting boost
+        sim_time_s   : float — current simulated time
+
+        Returns
+        -------
+        list of NeurochemicalEvent to inject (caller passes to neuro.update)
+        """
+        events: List[NeurochemicalEvent] = []
+
+        # Require Father to be live or recorded; joint attention from an absent
+        # Father cannot be detected
+        if self.state == PresenceState.FATHER_ABSENT:
+            return events
+
+        # ACh++ — opens the learning gate so STDP runs at full rate
+        events.append(NeurochemicalEvent(EventType.DIRECTED_GAZE, 0.8))
+        # OT+ — social context boosts STG STDP scale (as per Module 4 chemicals)
+        events.append(NeurochemicalEvent(EventType.VOICE_MATCH, 0.5))
+
+        log.info("Joint attention: Father names '%s' at sim_t=%.1fs", object_label, sim_time_s)
+
+        # Log the pairing event (consumed by MediaLearningSystem / cortex for binding)
+        entry = {
+            'event':       'joint_attention',
+            'label':       object_label,
+            'sim_time_s':  round(sim_time_s, 2),
+            'presence':    self.state,
+            'similarity':  round(self._last_similarity, 4),
+            'wall_time':   datetime.now(timezone.utc).isoformat(),
+        }
+        jfile = _paths.JOINT_ATTN_LOG
+        try:
+            with open(jfile, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(entry) + '\n')
+        except Exception:
+            pass
 
         return events
 
@@ -1315,12 +1344,16 @@ class _MotherFallback:
                 ))
 
         elif da < 0.07 and n_objects == 0:
-            # Low DA and empty world — add something to explore
+            # Low DA and empty world — add something to explore near CAINE
             uid = f'fallback_obj_{self._object_counter}'
             self._object_counter += 1
-            pos = [float(np.random.uniform(-2, 2)),
-                   float(np.random.uniform(0.5, 2.0)),
-                   float(np.random.uniform(3, 6))]
+            # Spawn within 2 units of CAINE's XZ position, 1-3 m in front
+            caine_pos = state.get('caine_pos', [0.0, 1.6, 0.0])
+            pos = [
+                float(caine_pos[0] + np.random.uniform(-1.5, 1.5)),
+                float(np.random.uniform(0.5, 2.0)),
+                float(caine_pos[2] + np.random.uniform(1.5, 3.5)),
+            ]
             actions.append(EnvironmentAction(
                 action='spawn_object',
                 params={
@@ -1332,16 +1365,9 @@ class _MotherFallback:
                                  float(np.random.uniform(0.4, 1.0)),
                                  float(np.random.uniform(0.4, 1.0))],
                 },
-                reasoning='Low dopamine, empty world: adding novel object.',
+                reasoning='Low dopamine, empty world: adding novel object near CAINE.',
                 timestamp_s=sim_time_s,
             ))
-            actions.append(EnvironmentAction(
-                action='trigger_event',
-                params={'event_type': 'NOVEL_STIMULUS', 'magnitude': 0.6},
-                reasoning='Novel object appeared.',
-                timestamp_s=sim_time_s,
-            ))
-
         elif ach < 0.08 and motor_score < 0.3:
             # Learning gate low — play a gentle tone to prime ACh
             freq = float(np.random.choice([220, 330, 440, 528, 660]))
@@ -1403,6 +1429,7 @@ class MotherProcess:
 
         self._consecutive_failures: int = 0
         self._using_fallback: bool = False
+        self._using_ollama:  bool = False   # True after successful Ollama probe
         self._fallback = _MotherFallback()
 
         # Action queue: produced by background thread, consumed by main thread
@@ -1415,7 +1442,7 @@ class MotherProcess:
         self._last_obs_sim_s: float = -MOTHER_INTERVAL_S  # fire immediately
 
         # Intervention log
-        self._log_file = os.path.join(_OUTPUT_DIR, 'mother_log.jsonl')
+        self._log_file = _paths.MOTHER_LOG
 
         self._running  = False
         self._thread: Optional[threading.Thread] = None
@@ -1424,22 +1451,27 @@ class MotherProcess:
 
     # ------------------------------------------------------------------
     def _init_client(self) -> None:
-        if not _ANTHROPIC_OK:
-            log.warning("anthropic package not installed. "
-                        "Mother will use rule-based fallback. "
-                        "Install with: pip install anthropic")
-            self._using_fallback = True
-            return
-        if not self._api_key or self._api_key == 'your_anthropic_api_key_here':
-            log.warning("ANTHROPIC_API_KEY not set in .env. "
-                        "Mother will use rule-based fallback.")
-            self._using_fallback = True
-            return
+        """
+        Probe local Ollama instance.  If reachable, use it as Mother's brain.
+        Falls back to rule-based system if Ollama is not running.
+        """
         try:
-            self._client = _anthropic_lib.Anthropic(api_key=self._api_key)
-            log.info("Mother connected to Claude API (model=%s).", self._model)
+            req = urllib.request.Request(
+                f'{_OLLAMA_URL}/api/tags',
+                method='GET',
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp.read()   # just confirm reachability
+            self._using_ollama = True
+            log.info("Mother connected to Ollama at %s (model=%s).",
+                     _OLLAMA_URL, _OLLAMA_MODEL)
         except Exception as e:
-            log.warning("Claude API client init failed: %s — using fallback.", e)
+            log.warning(
+                "Ollama not reachable at %s (%s) — Mother will use rule-based fallback.  "
+                "Start Ollama with:  ollama serve && ollama pull %s",
+                _OLLAMA_URL, e, _OLLAMA_MODEL,
+            )
+            self._using_ollama  = False
             self._using_fallback = True
 
     # ------------------------------------------------------------------
@@ -1448,8 +1480,9 @@ class MotherProcess:
         self._thread = threading.Thread(
             target=self._loop, name='mother', daemon=True)
         self._thread.start()
-        log.info("Mother process started (interval=%.0fs, api=%s).",
-                 MOTHER_INTERVAL_S, 'Claude' if not self._using_fallback else 'fallback')
+        backend = f'Ollama/{_OLLAMA_MODEL}' if self._using_ollama else 'rule-based fallback'
+        log.info("Mother process started (interval=%.0fs, backend=%s).",
+                 MOTHER_INTERVAL_S, backend)
 
     def stop(self) -> None:
         self._running = False
@@ -1492,16 +1525,16 @@ class MotherProcess:
     # ------------------------------------------------------------------
     def _observe_and_decide(self, state: dict) -> None:
         """
-        Call Claude (or fallback) and queue resulting actions.
+        Call Ollama (or rule-based fallback) and queue resulting actions.
         """
-        if self._using_fallback or self._client is None:
+        if self._using_fallback or not self._using_ollama:
             actions = self._fallback.decide(state)
             self._log_intervention(state, '(fallback)', actions)
             with self._queue_lock:
                 self._action_queue.extend(actions)
             return
 
-        # --- Build state payload for Claude ---
+        # --- Build state payload for Ollama ---
         payload = self._build_payload(state)
         user_message = (
             "Here is CAINE's current state:\n\n"
@@ -1509,26 +1542,40 @@ class MotherProcess:
             + "\n\nWhat do you do next?"
         )
 
-        # --- Call Claude ---
+        # --- Call Ollama ---
         try:
-            response = self._client.messages.create(
-                model   = self._model,
-                max_tokens = 1024,
-                system  = _MOTHER_SYSTEM_PROMPT,
-                messages = [{'role': 'user', 'content': user_message}],
+            body = json.dumps({
+                'model':   _OLLAMA_MODEL,
+                'system':  _MOTHER_SYSTEM_PROMPT_OLLAMA,   # compact prompt for local LLMs
+                'prompt':  user_message,
+                'stream':  False,
+                'options': {
+                    'num_ctx':     4096,   # full context window
+                    'num_predict': 512,    # allow complete JSON response
+                    'temperature': 0.6,
+                    'stop':        ['```'],  # stop on code fence
+                },
+            }).encode()
+            req = urllib.request.Request(
+                f'{_OLLAMA_URL}/api/generate',
+                data=body,
+                headers={'Content-Type': 'application/json'},
+                method='POST',
             )
-            raw = response.content[0].text.strip()
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                result = json.loads(resp.read())
+            raw = result.get('response', '').strip()
             self._consecutive_failures = 0
 
         except Exception as e:
             self._consecutive_failures += 1
-            log.warning("Claude API call failed (%d/%d): %s",
+            log.warning("Ollama call failed (%d/%d): %s",
                         self._consecutive_failures, MOTHER_FALLBACK_LIMIT, e)
             if self._consecutive_failures >= MOTHER_FALLBACK_LIMIT:
-                log.warning("Switching Mother to rule-based fallback.")
+                log.warning("Switching Mother to rule-based fallback (Ollama unreachable).")
                 self._using_fallback = True
             actions = self._fallback.decide(state)
-            self._log_intervention(state, f'(api_error: {e})', actions)
+            self._log_intervention(state, f'(ollama_error: {e})', actions)
             with self._queue_lock:
                 self._action_queue.extend(actions)
             return
@@ -1582,28 +1629,50 @@ class MotherProcess:
             'recent_episodes': state.get('recent_episodes', [])[-3:],
             'dev_flags': state.get('dev_flags', []),
             'consciousness_events_today': state.get('consciousness_events_today', 0),
+            'caine_pos': state.get('caine_pos', [0.0, 1.6, 0.0]),
         }
         return snap
 
     # ------------------------------------------------------------------
     def _parse_response(self, raw: str, sim_time_s: float) -> List[EnvironmentAction]:
         """
-        Parse Claude's JSON response into EnvironmentAction objects.
-        Silently ignores malformed entries to never crash the main loop.
+        Parse Ollama/Claude JSON response into EnvironmentAction objects.
+        Handles markdown code fences, truncated output, and prose padding.
         """
         actions: List[EnvironmentAction] = []
 
-        # Extract JSON array from response (Claude may add prose around it)
+        # Strip markdown code fences (phi3 and some models always emit these)
+        raw = raw.replace('```json', '').replace('```JSON', '').replace('```', '').strip()
+
+        # Find the JSON array bounds
         start = raw.find('[')
         end   = raw.rfind(']')
-        if start == -1 or end == -1:
+
+        if start == -1:
+            # No array found at all — empty response or pure prose
             return actions
 
-        try:
-            items = json.loads(raw[start:end + 1])
-        except json.JSONDecodeError as e:
-            log.warning("Mother response JSON parse error: %s\nRaw: %.200s", e, raw)
-            return actions
+        if end == -1 or end < start:
+            # Truncated response — attempt rescue: close any open object then close array
+            partial = raw[start:].rstrip().rstrip(',')
+            # Count braces to see if we're mid-object
+            opens  = partial.count('{')
+            closes = partial.count('}')
+            if opens > closes:
+                partial += '}' * (opens - closes)
+            partial += ']'
+            try:
+                items = json.loads(partial)
+                log.warning("Mother response was truncated — recovered %d item(s).", len(items))
+            except json.JSONDecodeError:
+                log.warning("Mother response truncated and unrecoverable:\n%.300s", raw)
+                return actions
+        else:
+            try:
+                items = json.loads(raw[start:end + 1])
+            except json.JSONDecodeError as e:
+                log.warning("Mother response JSON parse error: %s\nRaw: %.300s", e, raw)
+                return actions
 
         for item in items:
             if not isinstance(item, dict):
@@ -1715,17 +1784,25 @@ class ParentingSystem:
         # Development flags cache
         self._dev_flags: List[str] = []
 
+        # Clip ingestion queues -----------------------------------------------
+        # Audio: deque of float32 frames (each length CLIP_FRAME_SAMPLES)
+        # Video: deque of (H,W,3) uint8 frames
+        self._clip_audio_queue: deque = deque()
+        self._clip_video_queue: deque = deque()
+        self._clip_audio_lock  = threading.Lock()
+        self._clip_video_lock  = threading.Lock()
+
         log.info("ParentingSystem initialised.")
 
     # ------------------------------------------------------------------
     def start(self) -> None:
-        """
-        Start background processes (Mother thread).
-        Also runs voiceprint registration if not already done.
-        """
-        # Register Father's voiceprint on first run
-        if not self.voiceprint.is_registered:
-            self.voiceprint.register()
+        """Start background processes (Mother thread)."""
+        if self.voiceprint.is_registered:
+            log.info("Father fingerprint ready (exposure=%d frames).",
+                     self.voiceprint._exposure_frames)
+        else:
+            log.info("Father not yet recognised — will learn from voice exposure "
+                     "(%.0f%% of minimum).", self.voiceprint.exposure_pct)
 
         self.mother.start()
         log.info("ParentingSystem started.")
@@ -1735,6 +1812,210 @@ class ParentingSystem:
         """Gracefully stop Mother's background thread."""
         self.mother.stop()
         log.info("ParentingSystem stopped.")
+
+    # ------------------------------------------------------------------
+    # Clip ingestion — audio and video
+    # ------------------------------------------------------------------
+
+    _CLIP_FRAME_SR      = 22050   # target sample rate for injected audio
+    _CLIP_FRAME_SAMPLES = 441     # ~20 ms frames (must match SensoryLayer)
+    _CLIP_CAM_W         = 64      # target video width
+    _CLIP_CAM_H         = 64      # target video height
+
+    def accept_audio_clip(self, path: str,
+                          tag: str = '',
+                          stage_gate: int = 0,
+                          concept_label: str = '') -> bool:
+        """
+        Load an audio file and queue its frames for injection into the
+        auditory pipeline on subsequent ticks.
+
+        Supports WAV (stdlib) and any format soundfile can read.
+        Returns True on success.
+        """
+        path = os.path.normpath(path)
+        if not os.path.exists(path):
+            log.warning("accept_audio_clip: file not found: %s", path)
+            return False
+
+        # Copy to media library
+        dest_dir = os.path.join(_DATA_DIR, 'media_library')
+        os.makedirs(dest_dir, exist_ok=True)
+        import shutil as _shutil
+        dest = os.path.join(dest_dir, os.path.basename(path))
+        if not os.path.exists(dest):
+            _shutil.copy2(path, dest)
+
+        try:
+            audio = self._load_audio(path)
+        except Exception as e:
+            log.warning("accept_audio_clip: failed to load %s: %s", path, e)
+            return False
+
+        # Chunk into CLIP_FRAME_SAMPLES-sized frames
+        frames = [
+            audio[i:i + self._CLIP_FRAME_SAMPLES]
+            for i in range(0, len(audio), self._CLIP_FRAME_SAMPLES)
+        ]
+        # Pad last frame if needed
+        if frames and len(frames[-1]) < self._CLIP_FRAME_SAMPLES:
+            frames[-1] = np.pad(frames[-1],
+                                (0, self._CLIP_FRAME_SAMPLES - len(frames[-1])))
+
+        with self._clip_audio_lock:
+            for f in frames:
+                self._clip_audio_queue.append(f.astype(np.float32))
+
+        log.info("accept_audio_clip: queued %d frames from %s (tag=%s)",
+                 len(frames), os.path.basename(path), tag or 'none')
+
+        # Fire neurochemical events for Father-voice-like exposure
+        try:
+            self._neuro.update(0.0, events=[
+                NeurochemicalEvent(EventType.NOVEL_STIMULUS,   0.5),
+                NeurochemicalEvent(EventType.SOCIAL_POSITIVE,  0.3),
+            ])
+        except Exception:
+            pass
+
+        return True
+
+    def accept_video_clip(self, path: str,
+                          tag: str = '',
+                          stage_gate: int = 0,
+                          concept_label: str = '') -> bool:
+        """
+        Load a video file and queue its frames for injection into the
+        visual pipeline on subsequent ticks.
+
+        Requires opencv-python. Falls back to a single grey frame if unavailable.
+        Returns True on success.
+        """
+        path = os.path.normpath(path)
+        if not os.path.exists(path):
+            log.warning("accept_video_clip: file not found: %s", path)
+            return False
+
+        # Copy to media library
+        dest_dir = os.path.join(_DATA_DIR, 'media_library')
+        os.makedirs(dest_dir, exist_ok=True)
+        import shutil as _shutil
+        dest = os.path.join(dest_dir, os.path.basename(path))
+        if not os.path.exists(dest):
+            _shutil.copy2(path, dest)
+
+        try:
+            import cv2 as _cv2
+            cap    = _cv2.VideoCapture(path)
+            frames = []
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                # BGR → RGB, resize to 64×64
+                frame = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
+                frame = _cv2.resize(frame, (self._CLIP_CAM_W, self._CLIP_CAM_H))
+                frames.append(frame.astype(np.uint8))
+            cap.release()
+            if not frames:
+                raise ValueError("No frames decoded")
+        except ImportError:
+            log.warning("accept_video_clip: opencv-python not installed — "
+                        "queuing a single grey frame as placeholder.")
+            frames = [np.full((self._CLIP_CAM_H, self._CLIP_CAM_W, 3),
+                               128, dtype=np.uint8)]
+        except Exception as e:
+            log.warning("accept_video_clip: failed to load %s: %s", path, e)
+            return False
+
+        with self._clip_video_lock:
+            for f in frames:
+                self._clip_video_queue.append(f)
+
+        log.info("accept_video_clip: queued %d frames from %s (tag=%s)",
+                 len(frames), os.path.basename(path), tag or 'none')
+
+        try:
+            self._neuro.update(0.0, events=[
+                NeurochemicalEvent(EventType.NOVEL_STIMULUS, 0.6),
+                NeurochemicalEvent(EventType.DIRECTED_GAZE,  0.4),
+            ])
+        except Exception:
+            pass
+
+        return True
+
+    def pop_injected_audio(self) -> Optional[np.ndarray]:
+        """
+        Return the next queued audio frame (float32, CLIP_FRAME_SAMPLES long),
+        or None if no clip is playing.  Called by the main tick each frame.
+        """
+        with self._clip_audio_lock:
+            if self._clip_audio_queue:
+                return self._clip_audio_queue.popleft()
+        return None
+
+    def pop_injected_frame(self) -> Optional[np.ndarray]:
+        """
+        Return the next queued video frame ((64,64,3) uint8),
+        or None if no clip is playing.  Called by the main tick each frame.
+        """
+        with self._clip_video_lock:
+            if self._clip_video_queue:
+                return self._clip_video_queue.popleft()
+        return None
+
+    @staticmethod
+    def _load_audio(path: str) -> np.ndarray:
+        """
+        Load an audio file to a mono float32 array at CLIP_FRAME_SR.
+        Tries soundfile first, then wave stdlib.
+        """
+        # Try soundfile (handles MP3, FLAC, OGG, WAV, etc.)
+        try:
+            import soundfile as _sf
+            data, sr = _sf.read(path, dtype='float32', always_2d=False)
+            if data.ndim > 1:
+                data = data.mean(axis=1)   # stereo → mono
+            # Resample if needed (simple linear — good enough for speech)
+            target_sr = ParentingSystem._CLIP_FRAME_SR
+            if sr != target_sr:
+                factor = target_sr / sr
+                n_out  = int(len(data) * factor)
+                data   = np.interp(
+                    np.linspace(0, len(data) - 1, n_out),
+                    np.arange(len(data)),
+                    data,
+                ).astype(np.float32)
+            return data
+        except ImportError:
+            pass
+
+        # Fallback: stdlib wave (WAV only, PCM)
+        import wave as _wave
+        with _wave.open(path, 'rb') as wf:
+            n_ch    = wf.getnchannels()
+            sampw   = wf.getsampwidth()
+            sr      = wf.getframerate()
+            n_frm   = wf.getnframes()
+            raw     = wf.readframes(n_frm)
+
+        dtype = {1: np.int8, 2: np.int16, 4: np.int32}.get(sampw, np.int16)
+        pcm   = np.frombuffer(raw, dtype=dtype).astype(np.float32)
+        if n_ch > 1:
+            pcm = pcm.reshape(-1, n_ch).mean(axis=1)
+        pcm /= float(np.iinfo(dtype).max)   # normalize to [-1, 1]
+
+        # Resample
+        target_sr = ParentingSystem._CLIP_FRAME_SR
+        if sr != target_sr:
+            n_out = int(len(pcm) * target_sr / sr)
+            pcm   = np.interp(
+                np.linspace(0, len(pcm) - 1, n_out),
+                np.arange(len(pcm)),
+                pcm,
+            ).astype(np.float32)
+        return pcm
 
     # ------------------------------------------------------------------
     def update(self,
@@ -1875,6 +2156,15 @@ class ParentingSystem:
             valence_map = limbic_result.get('valence_map', {})
 
         # --- Push state to Mother ---
+        # CAINE's world-space position (for Mother's spatial reasoning)
+        _caine_pos = [0.0, 1.6, 0.0]
+        if self._env is not None:
+            try:
+                cp = self._env.get_caine_position()
+                _caine_pos = [round(float(v), 3) for v in cp]
+            except Exception:
+                pass
+
         mother_state = {
             'sim_time_s':              self._sim_time_s,
             'developmental_stage':     developmental_stage,
@@ -1895,6 +2185,7 @@ class ParentingSystem:
             'recent_episodes':         (limbic_result or {}).get('recent_episodes', []),
             'dev_flags':               self._dev_flags,
             'consciousness_events_today': self._consciousness_today,
+            'caine_pos':               _caine_pos,
         }
         self.mother.push_state(mother_state)
 
@@ -1908,6 +2199,7 @@ class ParentingSystem:
 
         return {
             'father_presence':          self.father.state,
+            'father_exposure_pct':      self.voiceprint.exposure_pct,
             'ot_level':                 self.father.ot_level,
             'cort_drift':               self.father.cort_drift_active,
             'sim_time_s':               self._sim_time_s,
@@ -1951,7 +2243,25 @@ class ParentingSystem:
 
             elif a == 'set_light':
                 if self._env is not None:
-                    color     = p.get('color', [1.0, 0.98, 0.9])
+                    color = p.get('color', [1.0, 0.98, 0.9])
+                    # LLM sometimes returns color names instead of RGB lists
+                    if isinstance(color, str):
+                        _COLOR_MAP = {
+                            'warm_amber':  [1.0, 0.75, 0.30],
+                            'warm_white':  [1.0, 0.95, 0.85],
+                            'cool_white':  [0.85, 0.90, 1.00],
+                            'soft_white':  [1.0, 0.92, 0.80],
+                            'dim':         [0.50, 0.45, 0.40],
+                            'bright':      [1.0, 1.00, 1.00],
+                            'red':         [1.0, 0.20, 0.10],
+                            'blue':        [0.20, 0.40, 1.00],
+                            'pink':        [1.0, 0.60, 0.70],
+                            'green':       [0.20, 0.80, 0.30],
+                        }
+                        color = _COLOR_MAP.get(
+                            color.lower().replace(' ', '_'),
+                            [1.0, 0.98, 0.90],
+                        )
                     intensity = float(p.get('intensity', 0.5))
                     self._env.set_environment_state({
                         'light_color': color,
@@ -1970,14 +2280,12 @@ class ParentingSystem:
                     self._sim_time_s, f'tone:{freq:.0f}Hz')
 
             elif a == 'trigger_event':
-                et_name = p.get('event_type', '')
-                mag     = float(p.get('magnitude', 0.5))
-                et      = _EVENT_TYPE_MAP.get(et_name)
-                if et is not None:
-                    self._limbic.trigger_event(et, mag)
-                else:
-                    log.warning("Mother: unknown event_type '%s'", et_name)
-                    return False
+                # Direct neurochemical injection is disabled — neurochemicals
+                # must arise from sensory stimuli, not Mother injection.
+                log.warning("Mother: trigger_event is disabled; use play_tone/"
+                            "spawn_object/set_light to create the sensory "
+                            "context instead.")
+                return False
 
             elif a == 'play_scheduled_media':
                 media_id = p.get('media_id', '')
@@ -2016,14 +2324,42 @@ class ParentingSystem:
     # Public convenience helpers
     # ------------------------------------------------------------------
 
+    def joint_attention(self, object_label: str,
+                        a1_rates: np.ndarray) -> None:
+        """
+        Convenience wrapper: Father points at an object and names it.
+
+        Injects the resulting ACh/OT boost into the neurochemical system
+        and logs the pairing event.  Call this from your main loop when
+        Father is present and interacting with an object.
+
+        Parameters
+        ----------
+        object_label : str  — what Father is saying / pointing at
+        a1_rates     : (N,) — current A1 firing pattern
+        """
+        events = self.father.joint_attention(
+            object_label, a1_rates, self._neuro, self._sim_time_s)
+        if events:
+            self._neuro.update(0.0, events=events)
+            self.consciousness.log_external_event(
+                self._sim_time_s, f'joint_attention:{object_label}')
+
     def add_session(self, session: dict) -> None:
         """Father can call this at runtime to add a new session."""
         self.scheduler.add_session(session)
 
-    def father_register_voiceprint(self,
-                                    a1_callback=None) -> bool:
-        """Re-run voiceprint registration (e.g. if Father's voice changes)."""
-        return self.voiceprint.register(a1_callback)
+    def father_reset_voiceprint(self) -> None:
+        """
+        Wipe the learned fingerprint and reset exposure to zero.
+        CAINE will re-learn Father from scratch.  Use if Father's voice
+        has changed significantly (illness, long absence, etc.).
+        """
+        self.voiceprint._a1_fingerprint  = None
+        self.voiceprint._exposure_frames  = 0
+        self.voiceprint._frames_since_save = 0
+        self.voiceprint._time_above_thresh_ms = 0.0
+        log.info("Father fingerprint reset — CAINE will re-learn from exposure.")
 
     @property
     def sim_time_s(self) -> float:
@@ -2114,16 +2450,18 @@ def run_parenting_demo(n_frames: int = 300, dt_ms: float = 20.0) -> None:
     with open(demo_sessions_file, 'w', encoding='utf-8') as f:
         json.dump([demo_session], f, indent=2)
 
-    # Force a clean voiceprint for demo (stub)
+    # Pre-seed a learned fingerprint for demo (simulates past exposure)
     demo_vp_file = os.path.join(_OUTPUT_DIR, 'voiceprint_demo.json')
+    # Father's A1 pattern: boosted mid-range channels (voice formants)
+    demo_fp = np.zeros(20, dtype=np.float32)
+    demo_fp[6:14] = 0.35   # mid-frequency channels respond to speech
+    demo_fp /= np.linalg.norm(demo_fp) + 1e-8
     stub_vp = {
-        'registered':        True,
-        'registration_date': datetime.now(timezone.utc).isoformat(),
-        'f0_range_hz':       [100.0, 220.0],
-        'formant_hz':        [650.0, 1150.0, 2450.0],
-        'speaking_rate':     4.2,
-        'spectral_envelope': [0.0] * 128,
-        'a1_fingerprint':    [0.1] * 20,
+        'exposure_frames': VOICEPRINT_MIN_EXPOSURE,   # fully learned
+        'last_updated':    datetime.now(timezone.utc).isoformat(),
+        'recognition_pct': 100.0,
+        'registered':      True,
+        'a1_fingerprint':  demo_fp.tolist(),
     }
     with open(demo_vp_file, 'w', encoding='utf-8') as f:
         json.dump(stub_vp, f, indent=2)
@@ -2162,13 +2500,12 @@ def run_parenting_demo(n_frames: int = 300, dt_ms: float = 20.0) -> None:
                       for i in range(6)], dtype=np.float32))
 
         # Build synthetic A1 rates
-        # Simulate Father's voice appearing briefly around frame 100-150
-        a1_base = rng.random(20) * 0.2
+        # Simulate Father's voice (mid-range A1 boost) around frames 100-150
+        a1_base = rng.random(20) * 0.05
         if 100 <= f < 150:
-            # Boost A1 to simulate Father speaking
-            a1_rates_demo = a1_base + 0.3
-        else:
-            a1_rates_demo = a1_base
+            # Father speaking: activate the same mid-range channels as the fingerprint
+            a1_base[6:14] += 0.35
+        a1_rates_demo = a1_base
 
         # Motor update
         v1_spk = rng.random(20) < 0.15

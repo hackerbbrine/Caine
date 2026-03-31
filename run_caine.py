@@ -31,6 +31,13 @@ import signal
 import time
 import logging
 
+# Optional: visualization WebSocket server (Module 10)
+try:
+    from caine.visualization import VisualizationServer
+    _VIZ_OK = True
+except ImportError:
+    _VIZ_OK = False
+
 # Force line-buffered stdout so status lines appear immediately even when
 # launched from an IDE, subprocess, or CI pipeline.
 if hasattr(sys.stdout, 'reconfigure'):
@@ -78,6 +85,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--update-every',  type=int, default=1,
                    metavar='N',
                    help='Redraw visualizer every N ticks (default 1)')
+    p.add_argument('--no-ws',         action='store_true',
+                   help='Disable WebSocket visualization server (port 7734)')
     return p.parse_args()
 
 
@@ -157,6 +166,36 @@ def main() -> None:
     viz, use_viz = _build_visualizer(args.headless)
 
     # -----------------------------------------------------------------------
+    # WebSocket visualization server — Module 10 (optional)
+    # -----------------------------------------------------------------------
+    ws_viz = None
+    if _VIZ_OK and not args.no_ws:
+        try:
+            ws_viz = VisualizationServer()
+            ws_viz.attach(
+                neuro         = brain.neuro,
+                v1            = brain.v1,
+                a1            = brain.a1,
+                sensory       = brain.sense,
+                env           = brain.env,
+                stage_manager = brain.stage_mgr,
+                avatar        = brain.avatar,
+                motor         = brain.motor,
+                parenting     = brain.parenting,
+                it            = getattr(brain, 'it',          None),
+                stg           = getattr(brain, 'stg',         None),
+                pfc           = getattr(brain, 'pfc',         None),
+                ag            = getattr(brain, 'ag',          None),
+                dmn           = getattr(brain, 'dmn',         None),
+                hippocampus   = getattr(brain.limbic, 'hippocampus', None),
+                media         = getattr(brain,        'media',       None),
+            )
+            log.info("WebSocket visualization server attached — ws://localhost:7734")
+        except Exception as e:
+            log.warning("WebSocket viz server failed to attach: %s", e)
+            ws_viz = None
+
+    # -----------------------------------------------------------------------
     # Start the brain (loads checkpoint, starts env + parenting)
     # -----------------------------------------------------------------------
     try:
@@ -164,6 +203,15 @@ def main() -> None:
     except Exception as e:
         log.error("Brain failed to start: %s", e)
         return
+
+    # Start WebSocket server after brain is live
+    if ws_viz is not None:
+        try:
+            ws_viz.start()
+            log.info("WebSocket viz server started — open ui/index.html in Electron.")
+        except Exception as e:
+            log.warning("WebSocket viz server failed to start: %s", e)
+            ws_viz = None
 
     # -----------------------------------------------------------------------
     # Main loop
@@ -176,6 +224,37 @@ def main() -> None:
 
     while not _shutdown[0]:
         t_start = time.perf_counter()
+
+        # ---- Sync viz server state → brain before each tick ----------------
+        # is_paused / time_scale are owned by the viz server; the loop mirrors
+        # them into the brain so Mission Control drives the simulation in
+        # real time.  Do this even when paused so the UI stays responsive.
+        if ws_viz is not None:
+            # Sync time multiplier (viz server owns time_scale)
+            brain.parenting._time_multiplier = ws_viz.time_scale
+
+            # Drain commands that ONLY the sim loop can handle:
+            #   stop          → exit the loop
+            #   stage_rollback → mutate stage manager
+            # Everything else (pause/resume/set_time_scale/cortisol_flush/
+            # forced_rest/mother_override/media_upload) is already handled
+            # inside VisualizationServer._handle_control_message().
+            for cmd in ws_viz.pop_commands():
+                action = cmd.get('action', '')
+                if action == 'stop':
+                    _shutdown[0] = True
+                    log.info("Mission Control: STOP")
+                elif action == 'stage_rollback':
+                    if brain.stage_mgr.stage > 0:
+                        brain.stage_mgr.stage -= 1
+                        brain.motor.developmental_stage = brain.stage_mgr.stage
+                        log.info("Mission Control: stage rollback → %d",
+                                 brain.stage_mgr.stage)
+
+        # ---- Pause: keep the loop alive but don't tick the brain -----------
+        if ws_viz is not None and ws_viz.is_paused:
+            time.sleep(0.05)
+            continue
 
         # ---- Tick the brain ------------------------------------------------
         try:
@@ -190,6 +269,22 @@ def main() -> None:
             break
 
         tick = result.get('tick', 0)
+
+        # ---- WebSocket visualization tick ----------------------------------
+        if ws_viz is not None:
+            try:
+                cortex_state = {
+                    'dmn_correlation': result.get('limbic_dmn_correlation', 0.0),
+                    'pfc_wm_span_ms':  result.get('limbic_pfc_wm_span_ms', 0.0),
+                }
+                ws_viz.tick(
+                    sim_time_s     = result.get('sim_time_s', brain.sim_time_s),
+                    dt_ms          = brain.frame_ms,
+                    sensory_result = brain._sense_result,
+                    cortex_state   = cortex_state,
+                )
+            except Exception as e:
+                log.debug("ws_viz.tick() error: %s", e)
 
         # ---- Console status (throttled to 1 Hz real-time) ------------------
         now = time.perf_counter()
@@ -278,6 +373,12 @@ def main() -> None:
     if use_viz:
         try:
             viz.close()
+        except Exception:
+            pass
+
+    if ws_viz is not None:
+        try:
+            ws_viz.stop()
         except Exception:
             pass
 

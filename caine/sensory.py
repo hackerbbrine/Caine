@@ -3,24 +3,34 @@ CAINE Sensory Layer — Module 5
 ================================
 Bridges raw world signals into the cortical populations built in Modules 1-4.
 
-Three sensory streams
----------------------
+Sensory streams
+---------------
   1. VISION   — 64×64 RGB frame  → DoG (ON/OFF)  → 4 orientation bands → V1
-  2. AUDIO    — 20ms PCM frames  → FFT → 128-band Mel filterbank → A1
-  3. PROPRIO  — 6 joint angles   → S1 stub population (20 neurons)
+  2. AUDIO    — 20ms PCM frames  → FFT → 128-band Mel → A1 → A2 → STG
+  3. PROPRIO  — joint angles     → S1 body-part columns (32 neurons)
+
+New in this module
+------------------
+  stg_lateral_inhibit()    — winner-take-more competition across STG
+  S1Encoder                — body-part columns: hand/arm/head/torso/foot (32 n)
+  VocalTract               — Kelly-Lochbaum 44-tube waveguide (Caine geometry)
+  RVCLayer                 — RVC voice conversion stub (pass-through)
+  ClipLearningQueue        — Caine clip queue: vocal/behavioral/self-recognition
 
 Requires only numpy / scipy (+ optional PyAudio for live mic input).
 
 Usage
 -----
-    from caine.sensory import SensoryLayer
-    from caine.cortex  import V1Population, A1Population
+    from caine.sensory  import SensoryLayer
+    from caine.cortex   import V1Population, A1Population, A2Population, STGPopulation
     from caine.chemicals import NeurochemicalSystem
 
     v1    = V1Population()
     a1    = A1Population()
+    a2    = A2Population()
+    stg   = STGPopulation()
     neuro = NeurochemicalSystem()
-    sense = SensoryLayer(v1, a1, neuro)
+    sense = SensoryLayer(v1, a1, neuro, a2=a2, stg=stg)
 
     # tick every ~20 ms
     frame        = env.get_camera_feed()          # (64,64,3) uint8
@@ -59,6 +69,13 @@ import matplotlib.gridspec as gridspec
 # -- intra-package imports ---------------------------------------------------
 from caine.cortex    import V1Population, A1Population
 from caine.chemicals import NeurochemicalSystem
+
+# A2Population and STGPopulation are available if cortex.py has been updated
+try:
+    from caine.cortex import A2Population, STGPopulation
+    _A2_STG_AVAILABLE = True
+except ImportError:
+    _A2_STG_AVAILABLE = False
 
 _OUTPUT_DIR = os.path.normpath(
     os.path.join(os.path.dirname(__file__), '..', 'output'))
@@ -177,32 +194,88 @@ def _orientation_energy(dog: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# S1 stub — proprioceptive population
+# STG lateral inhibition — winner-take-more phoneme competition
 # ---------------------------------------------------------------------------
 
-class S1Population:
+def stg_lateral_inhibit(stg_rates: np.ndarray,
+                         inhibit_strength: float = 0.6,
+                         inhibit_radius: int = 3) -> np.ndarray:
     """
-    Somatosensory (S1) stub — placeholder for full joint-angle tuning.
+    Winner-take-more lateral inhibition across STG phoneme population.
 
-    Encodes N_JOINTS joint angles into N_S1_NEURONS Gaussian tuned firing
-    rates.  Uses the same HH neuron foundation as V1/A1, but for now the
-    'spiking' is a simple rate code injection (efference copy signal).
+    Neurons that fire more strongly suppress their neighbours, sharpening
+    phoneme cluster selectivity.  Implements competitive interneuron dynamics:
+        output_i = rate_i − inhibit_strength × sum(rate_j, j ∈ neighbourhood)
+
+    Parameters
+    ----------
+    stg_rates        : (N_STG,) EMA firing-rate estimate array
+    inhibit_strength : inhibitory weight from neighbours [0, 1]
+    inhibit_radius   : neighbourhood half-width in neuron index space
+
+    Returns
+    -------
+    inhibited_rates : (N_STG,) non-negative rates after lateral competition
+    """
+    n = len(stg_rates)
+    rates = stg_rates.astype(np.float32)
+    output = rates.copy()
+    for i in range(n):
+        lo = max(0, i - inhibit_radius)
+        hi = min(n, i + inhibit_radius + 1)
+        nb_sum = rates[lo:hi].sum() - rates[i]
+        output[i] = rates[i] - inhibit_strength * nb_sum
+    return np.clip(output, 0.0, None)
+
+
+# ---------------------------------------------------------------------------
+# S1 body-part columns — somatosensory population
+# ---------------------------------------------------------------------------
+
+class S1Encoder:
+    """
+    Somatosensory S1 population with body-part columns.
+
+    Neuron allocation (32 total):
+        hand  : 12 neurons  (digits + palm, highest tactile resolution)
+        arm   :  6 neurons
+        head  :  6 neurons
+        torso :  4 neurons
+        foot  :  4 neurons
+
+    Each body-part column is assigned a joint channel and covers [−π, π]
+    with uniformly spaced circular Gaussian tuning curves.
+
+    Preserves the ``encode(joint_angles)`` and ``efference_copy()`` API.
     """
 
-    def __init__(self, n_neurons: int = N_S1_NEURONS, n_joints: int = N_JOINTS):
-        self.n_neurons = n_neurons
+    BODY_PARTS = {'hand': 12, 'arm': 6, 'head': 6, 'torso': 4, 'foot': 4}
+
+    def __init__(self, n_joints: int = N_JOINTS):
         self.n_joints  = n_joints
+        self.n_neurons = sum(self.BODY_PARTS.values())  # 32
 
-        # Each neuron prefers a specific angle in [−pi, pi] for one joint
-        # The neurons are evenly spread across joints × angles
-        self.pref_joint = np.arange(n_neurons) % n_joints
-        self.pref_angle = np.linspace(-np.pi, np.pi, n_neurons, endpoint=False)
+        # Build per-neuron preferred joint index and preferred angle
+        pref_joint: list = []
+        pref_angle: list = []
+        body_part_ranges: dict = {}
+        idx = 0
+        joint_alloc = list(range(n_joints))  # one joint per body part (cycle)
 
-        # Tuning width (radians)
-        self._sigma = 0.5
+        for bp_i, (bp_name, bp_n) in enumerate(self.BODY_PARTS.items()):
+            body_part_ranges[bp_name] = (idx, idx + bp_n)
+            j = joint_alloc[bp_i % len(joint_alloc)]
+            angles = np.linspace(-np.pi, np.pi, bp_n, endpoint=False)
+            for ang in angles:
+                pref_joint.append(j)
+                pref_angle.append(float(ang))
+            idx += bp_n
 
-        # Firing rate history for visualisation
-        self.rate_history = []
+        self.pref_joint        = np.array(pref_joint, dtype=int)
+        self.pref_angle        = np.array(pref_angle, dtype=np.float32)
+        self.body_part_ranges  = body_part_ranges
+        self._sigma            = 0.5
+        self.rate_history: list = []
 
     def encode(self, joint_angles: np.ndarray) -> np.ndarray:
         """
@@ -214,25 +287,326 @@ class S1Population:
 
         Returns
         -------
-        rates : (N_S1_NEURONS,) array, values in [0, 1]
+        rates : (32,) array, values in [0, 1]
         """
         rates = np.zeros(self.n_neurons, dtype=np.float32)
         for i in range(self.n_neurons):
             j   = self.pref_joint[i]
-            ang = joint_angles[j] if j < len(joint_angles) else 0.0
-            # Circular Gaussian tuning
-            diff      = ang - self.pref_angle[i]
-            diff      = (diff + np.pi) % (2 * np.pi) - np.pi  # wrap to [-pi,pi]
-            rates[i]  = np.exp(-0.5 * (diff / self._sigma) ** 2)
+            ang = float(joint_angles[j]) if j < len(joint_angles) else 0.0
+            diff = ang - self.pref_angle[i]
+            diff = (diff + np.pi) % (2 * np.pi) - np.pi  # wrap to [−π, π]
+            rates[i] = np.exp(-0.5 * (diff / self._sigma) ** 2)
         self.rate_history.append(rates.copy())
         return rates
 
     def efference_copy(self, joint_angles: np.ndarray) -> np.ndarray:
-        """
-        Return the S1 population rates as an efference copy signal.
-        Stub: identical to encode() for now.
-        """
+        """Efference copy — identical to encode() for now."""
         return self.encode(joint_angles)
+
+
+# Backward compatibility: old code using S1Population still works
+S1Population = S1Encoder
+
+
+# ---------------------------------------------------------------------------
+# VocalTract — Kelly-Lochbaum 44-tube waveguide
+# ---------------------------------------------------------------------------
+
+VOCAL_SR = 44100  # Hz — synthesis sample rate
+
+
+class VocalTract:
+    """
+    Kelly-Lochbaum digital waveguide vocal tract model.
+
+    Models Caine's vocal anatomy as 44 cylindrical tube sections from glottis
+    (section 0) to lips (section 43).  Cross-sectional areas are initialised
+    to Caine's anatomy: extra-wide oral cavity (large mouth).
+
+    Motor cortex varies ``areas`` in real time; the waveguide propagates a
+    glottal source pulse through the tube geometry and returns PCM audio.
+
+    K-L scattering at each junction k  (Γ_k = (A_k − A_{k+1})/(A_k + A_{k+1})):
+        new_fwd[k+1] = (1 + Γ_k) * p_fwd[k] − Γ_k * p_bwd[k+1]
+        new_bwd[k]   =  Γ_k * p_fwd[k] + (1 − Γ_k) * p_bwd[k+1]
+    Lip radiation:
+        p_bwd[−1] = r_rad * new_fwd[−1]   (r_rad ≈ −0.9)
+    Output sample: new_fwd[−1] (forward pressure at lips)
+    """
+
+    # Caine vocal tract geometry — 44 sections, cross-sectional area (cm²)
+    # fmt: off
+    _DEFAULT_AREAS = np.array([
+        # 0-9: sub-glottal trachea / lower pharynx (narrow → widening)
+        0.30, 0.34, 0.38, 0.42, 0.46, 0.50, 0.54, 0.58, 0.62, 0.60,
+        # 10-19: upper pharynx
+        0.80, 0.88, 0.96, 1.04, 1.10, 1.15, 1.18, 1.20, 1.20, 1.18,
+        # 20-33: oral cavity — EXTRA WIDE (Caine's large mouth)
+        2.00, 2.30, 2.60, 2.90, 3.10, 3.30, 3.50, 3.65,
+        3.80, 3.90, 4.00, 3.95, 3.85, 3.70,
+        # 34-41: front oral tapering toward lips
+        3.50, 3.20, 2.80, 2.40, 2.00, 1.70, 1.50, 1.30,
+        # 42-43: lips
+        0.80, 0.40,
+    ], dtype=np.float64)
+    # fmt: on
+
+    def __init__(self,
+                 areas: np.ndarray = None,
+                 pitch_hz: float = 120.0,
+                 glottal_open: float = 0.8,
+                 sr: int = VOCAL_SR):
+        self.areas        = areas.copy() if areas is not None else self._DEFAULT_AREAS.copy()
+        assert len(self.areas) == 44, "VocalTract requires exactly 44 tube sections"
+        self.pitch_hz     = float(pitch_hz)
+        self.glottal_open = float(glottal_open)  # 0=closed, 1=fully open
+        self.sr           = int(sr)
+
+        # Traveling wave state
+        self._p_fwd = np.zeros(44, dtype=np.float64)
+        self._p_bwd = np.zeros(44, dtype=np.float64)
+
+        # Glottal oscillator (sample counter for phase)
+        self._glottal_phase = 0.0
+
+        # Lip radiation reflection coefficient (negative = phase flip at open end)
+        self._r_rad = -0.9
+
+    # ------------------------------------------------------------------
+    # Internal: one-sample waveguide step
+    # ------------------------------------------------------------------
+
+    def _glottal_sample(self) -> float:
+        """Periodic triangle-wave glottal pulse at pitch_hz, scaled by glottal_open."""
+        period = self.sr / max(self.pitch_hz, 50.0)
+        frac   = (self._glottal_phase % period) / period
+        tri    = frac / 0.6 if frac < 0.6 else (1.0 - frac) / 0.4
+        self._glottal_phase += 1.0
+        return tri * self.glottal_open
+
+    def _scatter(self, g_in: float) -> float:
+        """
+        Advance waveguide one sample.  Injects glottal source at tube 0.
+        Returns output pressure sample at lips (tube 43).
+        """
+        areas = self.areas
+        p_f   = self._p_fwd
+        p_b   = self._p_bwd
+
+        # Reflection coefficients at 43 junctions
+        gamma = (areas[:-1] - areas[1:]) / (areas[:-1] + areas[1:] + 1e-12)
+
+        new_f = np.empty(44, dtype=np.float64)
+        new_b = np.empty(44, dtype=np.float64)
+
+        # Inject glottal source into section 0 (forward wave only)
+        new_f[0] = g_in
+
+        # Scattering at each junction (vectorised)
+        new_f[1:] = (1.0 + gamma) * p_f[:-1] - gamma * p_b[1:]
+        new_b[:-1] =        gamma  * p_f[:-1] + (1.0 - gamma) * p_b[1:]
+
+        # Lip radiation: reflection back into tube 43
+        new_b[-1] = self._r_rad * new_f[-1]
+
+        self._p_fwd = new_f
+        self._p_bwd = new_b
+
+        return float(new_f[-1])  # output = lip forward pressure
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def synthesize_frame(self, duration_ms: float) -> np.ndarray:
+        """
+        Synthesise one frame of PCM audio.
+
+        Parameters
+        ----------
+        duration_ms : frame duration in milliseconds
+
+        Returns
+        -------
+        pcm : float32 array of length round(sr * duration_ms / 1000),
+              normalised amplitude in [−1, 1]
+        """
+        n_samples = max(1, round(self.sr * duration_ms / 1000.0))
+        out = np.empty(n_samples, dtype=np.float64)
+        for i in range(n_samples):
+            out[i] = self._scatter(self._glottal_sample())
+
+        # Normalise to prevent clipping
+        peak = np.abs(out).max()
+        if peak > 1e-8:
+            out /= peak
+        return out.astype(np.float32)
+
+    def reset(self):
+        """Zero traveling wave state (use between utterances)."""
+        self._p_fwd[:] = 0.0
+        self._p_bwd[:] = 0.0
+        self._glottal_phase = 0.0
+
+
+# ---------------------------------------------------------------------------
+# RVCLayer — voice conversion stub
+# ---------------------------------------------------------------------------
+
+class RVCLayer:
+    """
+    RVC (Retrieval Voice Conversion) stub.
+
+    Sits between VocalTract output and audio playback.  When an RVC model
+    trained on show audio is available it will shift the timbre toward
+    Caine's canonical voice while preserving timing and emotional cadence.
+
+    Until then: pass-through (returns PCM unchanged).
+    """
+
+    def __init__(self, model_path: str = None):
+        self._model_path = model_path
+        self._model      = None
+        if model_path is not None and os.path.isfile(model_path):
+            # Future: load model weights here
+            print(f"[RVCLayer] Model file found at {model_path} — loading not yet implemented.")
+        else:
+            print("[RVCLayer] No RVC model — pass-through mode active.")
+
+    def convert(self, pcm: np.ndarray, sr: int = VOCAL_SR) -> np.ndarray:
+        """
+        Apply voice conversion to PCM audio.
+
+        Parameters
+        ----------
+        pcm : float32 PCM array
+        sr  : sample rate of the input
+
+        Returns
+        -------
+        float32 PCM array (same shape) — pass-through until model is loaded
+        """
+        if self._model is None:
+            return pcm.astype(np.float32)
+        # Future: return self._model.infer(pcm, sr)
+        return pcm.astype(np.float32)
+
+    @property
+    def is_active(self) -> bool:
+        """True when a real RVC model is loaded and conversion is live."""
+        return self._model is not None
+
+
+# ---------------------------------------------------------------------------
+# ClipLearningQueue — Caine video clip learning
+# ---------------------------------------------------------------------------
+
+class ClipLearningQueue:
+    """
+    Queue of Caine video clips used for three learning objectives:
+
+    1. **Vocal modeling**   — STG builds cadence/rhythm representations that
+                              motor learning targets for speech production.
+    2. **Behavioral modeling** — observing Caine interact with people teaches
+                                 social response patterns.
+    3. **Self recognition** — if CAINE's self-model matches IT visual
+                              representation of Caine-in-clip, that constitutes
+                              a mirror-test equivalent and is logged as a major
+                              developmental milestone.
+
+    Each queued clip is a dict:
+        { 'path': str, 'category': 'vocal'|'behavioral'|'self',
+          'loaded': bool, 'processed_frames': int }
+    """
+
+    SELF_RECOGNITION_LOG = os.path.join(
+        _OUTPUT_DIR, 'self_recognition_log.jsonl')
+
+    def __init__(self):
+        self._queue: list  = []
+        self._processed    = 0
+        self._self_recognized = False
+
+    def enqueue(self, path: str,
+                category: str = 'vocal') -> None:
+        """Add a clip to the learning queue."""
+        assert category in ('vocal', 'behavioral', 'self'), \
+            f"Unknown category '{category}'; use vocal/behavioral/self"
+        self._queue.append({
+            'path':             path,
+            'category':         category,
+            'loaded':           False,
+            'processed_frames': 0,
+        })
+
+    def next_frame(self) -> dict:
+        """
+        Return metadata for the next unprocessed clip frame.
+        Returns None when queue is empty.
+        """
+        if not self._queue:
+            return None
+        clip = self._queue[0]
+        clip['processed_frames'] += 1
+        clip['loaded'] = True
+        return clip
+
+    def mark_done(self) -> None:
+        """Mark the current front clip as fully consumed."""
+        if self._queue:
+            self._queue.pop(0)
+            self._processed += 1
+
+    def check_self_recognition(self,
+                                pfc_self_model: np.ndarray,
+                                it_visual_repr: np.ndarray,
+                                threshold: float = 0.75,
+                                t_ms: float = 0.0) -> bool:
+        """
+        Test whether PFC self-model matches IT visual representation of Caine.
+
+        Uses cosine similarity.  When similarity exceeds ``threshold`` for the
+        first time, logs a developmental milestone and returns True.
+
+        Parameters
+        ----------
+        pfc_self_model  : (N,) rate vector from PFC self-model sub-region
+        it_visual_repr  : (N,) rate vector from IT population
+        threshold       : cosine similarity threshold [0, 1]
+        t_ms            : current simulation time for the log
+        """
+        na = np.linalg.norm(pfc_self_model)
+        nb = np.linalg.norm(it_visual_repr)
+        if na < 1e-8 or nb < 1e-8:
+            return False
+
+        sim = float(np.dot(pfc_self_model, it_visual_repr) / (na * nb))
+        if sim >= threshold and not self._self_recognized:
+            self._self_recognized = True
+            self._log_milestone(t_ms, sim)
+            return True
+        return False
+
+    def _log_milestone(self, t_ms: float, similarity: float) -> None:
+        import json, time as _time
+        entry = {
+            'event':      'self_recognition',
+            't_ms':       t_ms,
+            'similarity': round(similarity, 4),
+            'wall_time':  _time.strftime('%Y-%m-%dT%H:%M:%S'),
+        }
+        with open(self.SELF_RECOGNITION_LOG, 'a') as fh:
+            fh.write(json.dumps(entry) + '\n')
+        print(f"[ClipLearningQueue] MILESTONE — self-recognition at t={t_ms:.1f} ms "
+              f"(cosine sim={similarity:.3f})")
+
+    @property
+    def queue_length(self) -> int:
+        return len(self._queue)
+
+    @property
+    def total_processed(self) -> int:
+        return self._processed
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +646,11 @@ class AudioStream:
 
         # Sweep frequency for demo fallback (Hz)
         self._sweep_freq = 440.0
+
+    @property
+    def mic_ok(self) -> bool:
+        """True when a live microphone stream is open and active."""
+        return self._stream is not None
 
     def read_frame(self) -> np.ndarray:
         """Return one frame of audio as a normalised float32 array."""
@@ -319,11 +698,17 @@ class SensoryLayer:
                  v1: V1Population,
                  a1: A1Population,
                  neuro: NeurochemicalSystem,
+                 a2=None,
+                 stg=None,
                  use_mic: bool = True):
         self.v1    = v1
         self.a1    = a1
         self.neuro = neuro
-        self.s1    = S1Population()
+        self.s1    = S1Encoder()
+
+        # Optional higher auditory cortex populations (A2 + STG)
+        self.a2  = a2   # A2Population or None
+        self.stg = stg  # STGPopulation or None
 
         # Mel filterbank (built once)
         self.mel_fb = build_mel_filterbank()
@@ -346,6 +731,8 @@ class SensoryLayer:
         self._mel_history:       list = []   # Mel energies
         self._v1_rate_history:   list = []   # V1 mean firing rates
         self._a1_rate_history:   list = []   # A1 mean firing rates
+        self._a2_rate_history:   list = []   # A2 EMA rates (if a2 present)
+        self._stg_rate_history:  list = []   # STG lateral-inhibited rates
         self._s1_rate_history:   list = []   # S1 firing rates
         self._neuro_history:     list = []   # neurochemical snapshots
 
@@ -372,8 +759,12 @@ class SensoryLayer:
 
         Returns
         -------
-        dict with keys: dog, mel_energy, orient_energy, s1_rates,
-                        v1_spikes, a1_spikes, neuro_snapshot
+        dict with keys:
+            dog, mel_energy, orient_energy, s1_rates,
+            v1_spikes, a1_spikes, neuro_snapshot,
+            a2_rates   (None if no A2Population provided),
+            stg_rates  (None if no STGPopulation provided; post-lateral-inhibition),
+            stg_spikes (None if no STGPopulation provided)
         """
         self._tick += 1
 
@@ -430,13 +821,48 @@ class SensoryLayer:
             spk = self.a1.detect_spikes(self._tick * dt_ms + step_i * HH_DT_MS)
             a1_spikes_accum |= spk
 
-        # ---- 3. Proprioception -------------------------------------------
+        # ---- 3. A2 temporal pattern detection (if available) -------------
+        a2_rates   = None
+        a2_spikes  = None
+        if self.a2 is not None:
+            # Convert A1 spike accumulator to Hz estimate for this frame
+            a1_hz = a1_spikes_accum.astype(np.float32) * (1000.0 / dt_ms)
+            I_a2  = self.a2.compute_drive(a1_hz)
+            a2_spikes_accum = np.zeros(self.a2.n, dtype=bool)
+            for step_i in range(n_steps):
+                self.a2.step(HH_DT_MS, I_a2)
+                spk = self.a2.detect_spikes(self._tick * dt_ms + step_i * HH_DT_MS)
+                a2_spikes_accum |= spk
+            self.a2.update_rate_est(a2_spikes_accum, HH_DT_MS)
+            a2_rates  = self.a2.rate_est.copy()
+            a2_spikes = a2_spikes_accum
+
+        # ---- 4. STG phoneme emergence (if available) ---------------------
+        stg_rates_inhibited = None
+        stg_spikes          = None
+        if self.stg is not None and a2_rates is not None:
+            I_stg = self.stg.compute_drive(a2_rates)
+            stg_spikes_accum = np.zeros(self.stg.n, dtype=bool)
+            for step_i in range(n_steps):
+                self.stg.step(HH_DT_MS, I_stg)
+                spk = self.stg.detect_spikes(self._tick * dt_ms + step_i * HH_DT_MS)
+                stg_spikes_accum |= spk
+            # STDP update gated by oxytocin scale
+            ot_scale = self.neuro.oxytocin_stg_scale() if hasattr(self.neuro, 'oxytocin_stg_scale') else 1.0
+            t_now = self._tick * dt_ms
+            self.stg.stdp_update(stg_spikes_accum, t_now, a2_rates, neuro_scale=ot_scale)
+            self.stg.update_rate_est(stg_spikes_accum, HH_DT_MS)
+            # Winner-take-more lateral inhibition
+            stg_rates_inhibited = stg_lateral_inhibit(self.stg.rate_est)
+            stg_spikes          = stg_spikes_accum
+
+        # ---- 5. Proprioception -------------------------------------------
         s1_rates = self.s1.encode(joint_angles)
 
-        # ---- 4. Neurochemical update (motor/prediction signals) ----------
+        # ---- 6. Neurochemical update (motor/prediction signals) ----------
         neuro_snapshot = self.neuro.snapshot()
 
-        # ---- 5. Store histories for visualisation ------------------------
+        # ---- 7. Store histories for visualisation ------------------------
         self._frame_history.append(frame_rgb.copy())
         self._dog_history.append(dog.copy())
         self._audio_history.append(audio_frame.copy())
@@ -444,6 +870,10 @@ class SensoryLayer:
         self._mel_history.append(mel_norm.copy())
         self._v1_rate_history.append(v1_spikes_accum.astype(float))
         self._a1_rate_history.append(a1_spikes_accum.astype(float))
+        if a2_rates is not None:
+            self._a2_rate_history.append(a2_rates.copy())
+        if stg_rates_inhibited is not None:
+            self._stg_rate_history.append(stg_rates_inhibited.copy())
         self._s1_rate_history.append(s1_rates.copy())
         self._neuro_history.append(neuro_snapshot)
 
@@ -451,18 +881,22 @@ class SensoryLayer:
         for buf in (self._frame_history, self._dog_history,
                     self._audio_history, self._fft_history,
                     self._mel_history, self._v1_rate_history,
-                    self._a1_rate_history, self._s1_rate_history,
+                    self._a1_rate_history, self._a2_rate_history,
+                    self._stg_rate_history, self._s1_rate_history,
                     self._neuro_history):
             if len(buf) > 50:
                 buf.pop(0)
 
         return {
-            'dog':           dog,
-            'mel_energy':    mel_norm,
-            'orient_energy': orient_energy,
-            's1_rates':      s1_rates,
-            'v1_spikes':     v1_spikes_accum,
-            'a1_spikes':     a1_spikes_accum,
+            'dog':            dog,
+            'mel_energy':     mel_norm,
+            'orient_energy':  orient_energy,
+            's1_rates':       s1_rates,
+            'v1_spikes':      v1_spikes_accum,
+            'a1_spikes':      a1_spikes_accum,
+            'a2_rates':       a2_rates,           # None if a2 not provided
+            'stg_rates':      stg_rates_inhibited, # None if stg not provided
+            'stg_spikes':     stg_spikes,          # None if stg not provided
             'neuro_snapshot': neuro_snapshot,
         }
 
@@ -597,7 +1031,7 @@ class SensoryLayer:
         1  Top-left  : Raw camera frame + DoG overlay
         2  Top-right : Audio waveform, FFT magnitude, Mel bar chart
         3  Bottom-left  : V1 / A1 / S1 population firing rates (heatmaps)
-        4  Bottom-right : Neurochemical state from Module 3
+        4  Bottom-right : Neurochemical state from Module 4
 
         Returns the path to the saved PNG.
         """
@@ -701,8 +1135,19 @@ class SensoryLayer:
         ax_mel.tick_params(labelsize=7)
 
     def _draw_cortex_panel(self, ax):
-        """Panel 3: V1, A1, S1 firing rate heatmaps over time."""
-        ax.set_title("Cortex: V1 / A1 / S1 firing rates", fontsize=11)
+        """Panel 3: V1 / A1 / A2 / STG / S1 firing rate heatmaps over time."""
+        # Build the list of rows to display (always V1/A1/S1; add A2/STG if present)
+        rows = []
+        rows.append((self._v1_rate_history,  'V1'))
+        rows.append((self._a1_rate_history,  'A1'))
+        if self._a2_rate_history:
+            rows.append((self._a2_rate_history,  'A2'))
+        if self._stg_rate_history:
+            rows.append((self._stg_rate_history, 'STG'))
+        rows.append((self._s1_rate_history,  'S1'))
+
+        labels = ' / '.join(r[1] for r in rows)
+        ax.set_title(f"Cortex: {labels} firing rates", fontsize=11)
         ax.axis('off')
         parent_fig = ax.get_figure()
         bbox = ax.get_position()
@@ -713,26 +1158,24 @@ class SensoryLayer:
                 return np.zeros((1, 1))
             return np.array(buf).T  # (neurons, time)
 
-        v1_mat = _make_heatmap(self._v1_rate_history)
-        a1_mat = _make_heatmap(self._a1_rate_history)
-        s1_mat = _make_heatmap(self._s1_rate_history)
+        n_rows  = len(rows)
+        row_h   = 0.95 / n_rows  # fractional height per row (with small gap)
+        gap     = 0.02
 
-        ax_v1 = parent_fig.add_axes([x0,           y0 + h * 0.67, w, h * 0.30])
-        ax_a1 = parent_fig.add_axes([x0,           y0 + h * 0.34, w, h * 0.30])
-        ax_s1 = parent_fig.add_axes([x0,           y0,             w, h * 0.30])
-
-        for sub_ax, mat, label in [
-            (ax_v1, v1_mat, 'V1'),
-            (ax_a1, a1_mat, 'A1'),
-            (ax_s1, s1_mat, 'S1'),
-        ]:
+        sub_axes = []
+        for i, (buf, label) in enumerate(rows):
+            mat   = _make_heatmap(buf)
+            y_pos = y0 + h * (1.0 - (i + 1) * row_h)
+            sub_ax = parent_fig.add_axes([x0, y_pos, w, h * (row_h - gap)])
             sub_ax.imshow(mat, aspect='auto', interpolation='nearest',
                           cmap='hot', vmin=0, vmax=1)
             sub_ax.set_ylabel(label, fontsize=9, rotation=0, labelpad=18)
             sub_ax.set_xticks([])
             sub_ax.tick_params(labelsize=7)
+            sub_axes.append(sub_ax)
 
-        ax_s1.set_xlabel("time (frames)", fontsize=8)
+        if sub_axes:
+            sub_axes[-1].set_xlabel("time (frames)", fontsize=8)
 
     def _draw_neuro_panel(self, ax):
         """Panel 4: neurochemical state over time."""
@@ -781,8 +1224,18 @@ def run_sensory_demo(n_frames: int = 30, dt_ms: float = 20.0):
     a1    = A1Population(n_neurons=20)
     neuro = NeurochemicalSystem()
 
+    # Wire A2 + STG if available (updated cortex.py)
+    a2_pop  = None
+    stg_pop = None
+    if _A2_STG_AVAILABLE:
+        a2_pop  = A2Population()
+        stg_pop = STGPopulation()
+        print("[sensory] A2 + STG populations wired in.")
+    else:
+        print("[sensory] A2/STG not available — running V1/A1/S1 only.")
+
     # Build sensory layer (no mic needed)
-    sense = SensoryLayer(v1, a1, neuro, use_mic=False)
+    sense = SensoryLayer(v1, a1, neuro, a2=a2_pop, stg=stg_pop, use_mic=False)
 
     print(f"[sensory] Running demo: {n_frames} frames x {dt_ms} ms each")
 
@@ -826,10 +1279,15 @@ def run_sensory_demo(n_frames: int = 30, dt_ms: float = 20.0):
                               injected_audio=audio)
 
         if f % 10 == 0:
-            n_v1 = result['v1_spikes'].sum()
-            n_a1 = result['a1_spikes'].sum()
-            print(f"  frame {f:3d}: V1 spikes={n_v1:2d}  A1 spikes={n_a1:2d}"
-                  f"  orient_energy={result['orient_energy'].round(3)}")
+            n_v1  = result['v1_spikes'].sum()
+            n_a1  = result['a1_spikes'].sum()
+            a2_str  = (f"  A2 rate_max={result['a2_rates'].max():.2f}"
+                       if result['a2_rates'] is not None else '')
+            stg_str = (f"  STG top={result['stg_rates'].max():.2f}"
+                       if result['stg_rates'] is not None else '')
+            print(f"  frame {f:3d}: V1={n_v1:2d}  A1={n_a1:2d}"
+                  f"{a2_str}{stg_str}"
+                  f"  orient={result['orient_energy'].round(3)}")
 
     # Final visualisation
     path = sense.visualize()

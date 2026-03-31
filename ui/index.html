@@ -1,0 +1,1308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="
+          default-src 'self';
+          script-src  'self' 'unsafe-inline' https://cdn.jsdelivr.net;
+          style-src   'self' 'unsafe-inline';
+          connect-src ws://localhost:7734;
+          img-src     'self' data: blob:;
+          font-src    'self' data:;
+        ">
+  <title>CAINE — Mission Control</title>
+  <style>
+    :root {
+      --bg:      #080810;
+      --panel:   #0e0e1a;
+      --border:  #1c1c2e;
+      --text:    #b0b0c8;
+      --dim:     #484860;
+      --accent:  #4169e1;
+      --green:   #3cb371;
+      --red:     #ff4040;
+      --orange:  #ff8c00;
+      --purple:  #da70d6;
+      --sky:     #4682b4;
+      --font:    'Courier New', monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 11px; }
+
+    /* ── Header ─────────────────────────────────────────────────── */
+    #hdr {
+      height: 30px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 12px; padding: 0 12px;
+      flex-shrink: 0;
+    }
+    #hdr .logo { font-size: 13px; font-weight: bold; color: var(--accent); letter-spacing: 3px; }
+    #ws-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); flex-shrink: 0; }
+    #ws-dot.on { background: var(--green); }
+    #ws-lbl { font-size: 9px; color: var(--dim); }
+    #sim-t  { margin-left: auto; color: var(--dim); font-size: 10px; }
+
+    /* ── Main layout (flex column) ────────────────────────────────── */
+    #main { display: flex; flex-direction: column; height: calc(100vh - 30px); padding: 2px; gap: 0; }
+
+    /* Top strip: three columns + drag dividers */
+    #top-strip { display: flex; flex-direction: row; flex: 1 1 auto; min-height: 0; }
+
+    #col-brain  { flex: 0 0 42%; min-width: 100px; display: flex; flex-direction: column; }
+    #col-center { flex: 0 0 29%; min-width: 80px;  display: flex; flex-direction: column; gap: 2px; }
+    #col-right  { flex: 1 1 auto; min-width: 80px; display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
+
+    /* Drag handles */
+    .col-div { flex: 0 0 3px; cursor: col-resize; background: var(--border); transition: background 0.12s; }
+    .col-div:hover, .col-div.drag { background: var(--accent); }
+    .row-div { flex: 0 0 3px; cursor: row-resize; background: var(--border); transition: background 0.12s; }
+    .row-div:hover, .row-div.drag { background: var(--accent); }
+
+    /* ── Panels ──────────────────────────────────────────────────── */
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+    .ptitle {
+      padding: 3px 7px;
+      font-size: 9px; letter-spacing: 1px; color: var(--accent);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .ptitle span { color: var(--dim); font-size: 8px; }
+    .pbody { flex: 1; overflow: hidden; position: relative; }
+
+    /* Brain panel fills left col */
+    #panel1 { flex: 1; }
+    #brain-cv { display: block; width: 100%; height: 100%; }
+
+    /* Vision panel */
+    #panel2 { flex: 0 0 55%; }
+    .vis-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: 1fr auto auto;
+      gap: 2px; padding: 2px; height: 100%;
+    }
+    .vis-cam { grid-column: 1; grid-row: 1; overflow: hidden; }
+    #cam-img  { width: 100%; height: 100%; object-fit: cover; display: block; image-rendering: pixelated; }
+    .vis-right{ grid-column: 2; grid-row: 1; display: flex; flex-direction: column; gap: 2px; }
+    .vis-it   { grid-column: 1 / 3; grid-row: 3; }
+    .vis-ach  { grid-column: 1 / 3; grid-row: 2; }
+
+    /* Audio panel */
+    #panel3 { flex: 1; }
+    .aud-layout { display: flex; flex-direction: column; height: 100%; padding: 2px; gap: 2px; }
+    .stg-box { background: #0d0d20; border: 1px solid var(--accent); border-radius: 3px; padding: 3px 6px; text-align: center; flex-shrink: 0; }
+    .stg-ph  { font-size: 20px; color: var(--accent); }
+    .stg-cf  { font-size: 8px; color: var(--dim); }
+
+    /* Right col panels */
+    #panel4, #panel5, #panel6, #panel7 { flex-shrink: 0; }
+    #col-right { scrollbar-width: thin; scrollbar-color: var(--border) var(--bg); }
+
+    /* Chem charts */
+    .chem-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; padding: 3px; }
+    .chem-wrap { position: relative; }
+    .chem-cv  { display: block; width: 100%; height: 44px; background: #0a0a12; }
+    .chem-name { position: absolute; top: 2px; left: 4px; font-size: 8px; }
+    .chem-num  { position: absolute; top: 2px; right: 4px; font-size: 8px; }
+
+    /* Event log */
+    .evlog { overflow-y: auto; max-height: 70px; padding: 0 6px 4px; }
+    .evrow { font-size: 8px; color: var(--dim); padding: 1px 0; border-bottom: 1px solid #0f0f18; }
+    .evrow b { margin-right: 5px; }
+
+    /* Metrics */
+    .mrow { display: flex; justify-content: space-between; padding: 2px 7px; border-bottom: 1px solid var(--border); }
+    .ml { color: var(--dim); }
+    .mv { color: var(--text); }
+
+    /* Stage badge */
+    .sbadge { display: inline-block; padding: 2px 10px; border-radius: 3px; font-size: 10px; font-weight: bold; margin: 5px 7px; border: 1px solid; }
+
+    /* Conditions checklist */
+    .cond-grid { display: grid; grid-template-columns: auto 1fr; gap: 1px 6px; padding: 2px 7px 4px; font-size: 9px; }
+    .cond-dot  { width: 6px; height: 6px; border-radius: 50%; display: inline-block; flex-shrink: 0; align-self: center; }
+
+    /* Emotion badge */
+    .ebadge { display: inline-block; padding: 2px 10px; border-radius: 3px; border: 1px solid; margin: 4px 7px; font-size: 10px; }
+
+    /* Controls */
+    .ctrl-row { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 7px; border-bottom: 1px solid var(--border); align-items: center; }
+    .ctrl-lbl { color: var(--dim); font-size: 9px; }
+    .btn { background: #13132a; border: 1px solid var(--border); color: var(--text); padding: 3px 8px; border-radius: 3px; cursor: pointer; font-family: var(--font); font-size: 9px; }
+    .btn:hover { background: #1e1e3a; }
+    .btn.g { border-color: var(--green);  color: var(--green); }
+    .btn.r { border-color: var(--red);    color: var(--red); }
+    .btn.o { border-color: var(--orange); color: var(--orange); }
+    input[type=range] { accent-color: var(--accent); vertical-align: middle; }
+
+    /* Scheduled list */
+    .sched-list { max-height: 60px; overflow-y: auto; padding: 2px 7px; }
+    .sched-row  { font-size: 8px; color: var(--dim); padding: 1px 0; border-bottom: 1px solid #0f0f18; }
+
+    /* Mother pending */
+    .mpend { background: #0d0d20; border: 1px solid var(--accent); border-radius: 3px; padding: 3px 7px; margin: 3px 7px; font-size: 9px; min-height: 22px; word-break: break-word; }
+
+    /* canvas labels */
+    .cv-lbl { font-size: 8px; color: var(--dim); padding: 1px 4px; }
+
+    /* Panel 8: Environment Observer (bottom strip) */
+    #panel8 { flex: 0 0 220px; min-height: 80px; flex-direction: column; }
+    #env-strip { display: flex; flex: 1; overflow: hidden; min-height: 0; }
+    #env-cam-col {
+      flex: 0 0 55%; border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    #env-cv {
+      flex: 1; min-height: 0; display: block; width: 100%; height: 100%;
+      background: #000000;
+    }
+    #env-objs {
+      flex: 0 0 auto; max-height: 52px; overflow-y: auto;
+      padding: 2px 6px; border-top: 1px solid var(--border); font-size: 8px;
+    }
+    .env-obj-row {
+      color: var(--dim); padding: 1px 0;
+      display: flex; justify-content: space-between; align-items: center;
+      border-bottom: 1px solid #0a0a14; gap: 4px;
+    }
+    #env-ctrl-col { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
+    .ecsec { border-bottom: 1px solid var(--border); padding: 3px 6px; }
+    .ecsec-lbl { font-size: 8px; color: var(--dim); letter-spacing: 1px; margin-bottom: 2px; }
+    .ecrow { display: flex; align-items: center; gap: 3px; flex-wrap: wrap; margin-bottom: 1px; }
+    .einp {
+      background: #0a0a14; border: 1px solid var(--border); color: var(--text);
+      font-family: var(--font); font-size: 9px; padding: 1px 3px; border-radius: 2px; width: 52px;
+    }
+    .einp.sm { width: 38px; }
+    select.einp { width: auto; cursor: pointer; }
+
+    canvas { display: block; }
+    ::-webkit-scrollbar { width: 3px; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  </style>
+</head>
+<body>
+
+<!-- Header -->
+<div id="hdr">
+  <span class="logo">CAINE</span>
+  <div id="ws-dot"></div>
+  <span id="ws-lbl">ws://localhost:7734</span>
+  <span id="sim-t">t = 0.000 s</span>
+</div>
+
+<!-- Main layout -->
+<div id="main">
+<div id="top-strip">
+
+  <!-- Left: 3D Brain -->
+  <div id="col-brain">
+    <div class="panel" id="panel1" style="flex:1;">
+      <div class="ptitle">01 — 3D BRAIN <span id="neuron-ct"></span></div>
+      <div class="pbody" style="flex:1;">
+        <canvas id="brain-cv"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-div" id="col-div-1"></div>
+
+  <!-- Center: Vision + Audio -->
+  <div id="col-center">
+
+    <!-- Panel 2: Vision -->
+    <div class="panel" id="panel2" style="flex:0 0 55%;">
+      <div class="ptitle">02 — VISION FEED</div>
+      <div class="pbody">
+        <div class="vis-grid">
+          <div class="vis-cam"><img id="cam-img" src="" alt="cam"></div>
+          <div class="vis-right">
+            <div class="cv-lbl">V1 ORIENTATION</div>
+            <canvas id="v1-cv" style="height:40px;"></canvas>
+            <div class="cv-lbl">IT ACTIVATION</div>
+            <canvas id="it-cv" style="height:30px;"></canvas>
+          </div>
+          <div class="vis-ach">
+            <div class="cv-lbl">ACh ATTENTION MAP (8×8)</div>
+            <canvas id="ach-cv" style="height:50px;"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel 3: Auditory -->
+    <div class="panel" id="panel3" style="flex:1;">
+      <div class="ptitle">03 — AUDITORY FEED</div>
+      <div class="pbody">
+        <div class="aud-layout">
+          <canvas id="wave-cv" style="flex-shrink:0; height:36px;"></canvas>
+          <canvas id="mel-cv"  style="flex-shrink:0; height:48px;"></canvas>
+          <canvas id="a1-cv"   style="flex-shrink:0; height:36px;"></canvas>
+          <div class="stg-box">
+            <div class="stg-ph" id="stg-ph">—</div>
+            <div class="stg-cf" id="stg-cf">confidence: 0.00</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /col-center -->
+
+  <div class="col-div" id="col-div-2"></div>
+
+  <!-- Right: Neuro + Dev + Internal + MC -->
+  <div id="col-right">
+
+    <!-- Panel 4: Neurochemicals -->
+    <div class="panel" id="panel4">
+      <div class="ptitle">04 — NEUROCHEMICALS</div>
+      <div class="chem-grid" id="chem-grid"></div>
+      <div class="ptitle" style="border-top:1px solid var(--border); margin-top:2px;">EVENT LOG</div>
+      <div class="evlog" id="evlog"></div>
+    </div>
+
+    <!-- Panel 5: Developmental Metrics -->
+    <div class="panel" id="panel5">
+      <div class="ptitle">05 — DEVELOPMENTAL METRICS</div>
+      <div id="dev-body"></div>
+    </div>
+
+    <!-- Panel 6: Internal State -->
+    <div class="panel" id="panel6">
+      <div class="ptitle">06 — INTERNAL STATE <span>(INFERRED — NOT GROUND TRUTH)</span></div>
+      <div id="int-body"></div>
+    </div>
+
+    <!-- Panel 7: Mission Control -->
+    <div class="panel" id="panel7">
+      <div class="ptitle">07 — MISSION CONTROL</div>
+      <div id="mc-body"></div>
+    </div>
+
+  </div><!-- /col-right -->
+
+</div><!-- /top-strip -->
+<div class="row-div" id="row-div"></div>
+
+  <!-- Panel 8: Environment Observer -->
+  <div class="panel" id="panel8">
+    <div class="ptitle">08 — ENVIRONMENT OBSERVER <span id="env-stage-badge" style="color:var(--orange)"></span></div>
+    <div class="pbody" id="env-strip">
+
+      <!-- Left: Three.js 3D environment viewport + objects list -->
+      <div id="env-cam-col">
+        <canvas id="env-cv"></canvas>
+        <div id="env-objs"><span style="color:var(--dim)">no objects in scene</span></div>
+      </div>
+
+      <!-- Right: controls -->
+      <div id="env-ctrl-col">
+
+        <!-- Spawn -->
+        <div class="ecsec">
+          <div class="ecsec-lbl">SPAWN OBJECT</div>
+          <div class="ecrow">
+            <select class="einp" id="spawn-type">
+              <option value="sphere">sphere</option>
+              <option value="cube">cube</option>
+              <option value="face">face</option>
+              <option value="toy">toy</option>
+              <option value="light">light</option>
+            </select>
+            <span style="color:var(--dim);font-size:8px">x</span>
+            <input class="einp sm" type="number" id="spawn-x" value="0" step="0.5">
+            <span style="color:var(--dim);font-size:8px">y</span>
+            <input class="einp sm" type="number" id="spawn-y" value="1" step="0.5">
+            <span style="color:var(--dim);font-size:8px">z</span>
+            <input class="einp sm" type="number" id="spawn-z" value="2" step="0.5">
+            <button class="btn g" id="btn-spawn">SPAWN</button>
+          </div>
+        </div>
+
+        <!-- Light -->
+        <div class="ecsec">
+          <div class="ecsec-lbl">LIGHT</div>
+          <div class="ecrow">
+            <span style="color:var(--dim);font-size:8px">color</span>
+            <input type="color" id="light-col" value="#fffae6" style="width:26px;height:17px;border:1px solid var(--border);background:#0a0a14;cursor:pointer;border-radius:2px;">
+            <span style="color:var(--dim);font-size:8px">intensity</span>
+            <input type="range" id="light-int" min="0" max="1" step="0.05" value="0.15" style="width:60px;accent-color:var(--orange);">
+            <span id="light-int-val" style="color:var(--orange);font-size:9px;width:28px;">0.15</span>
+            <button class="btn o" id="btn-light">SET</button>
+          </div>
+        </div>
+
+        <!-- Tone -->
+        <div class="ecsec">
+          <div class="ecsec-lbl">PLAY TONE</div>
+          <div class="ecrow">
+            <span style="color:var(--dim);font-size:8px">Hz</span>
+            <input class="einp" type="number" id="tone-hz" value="440" step="10" min="20" max="8000">
+            <span style="color:var(--dim);font-size:8px">dur</span>
+            <input class="einp sm" type="number" id="tone-dur" value="0.5" step="0.1" min="0.1" max="10">
+            <span style="color:var(--dim);font-size:8px">vol</span>
+            <input class="einp sm" type="number" id="tone-vol" value="0.5" step="0.1" min="0" max="1">
+            <button class="btn" id="btn-tone">▶ PLAY</button>
+          </div>
+        </div>
+
+        <!-- Event Scheduler -->
+        <div class="ecsec" style="flex:1;">
+          <div class="ecsec-lbl">SCHEDULE EVENT</div>
+          <div class="ecrow">
+            <span style="color:var(--dim);font-size:8px">at t=</span>
+            <input class="einp" type="number" id="sched-t" value="60" step="1" min="0">
+            <span style="color:var(--dim);font-size:8px">s  action</span>
+            <select class="einp" id="sched-act">
+              <option value="env_spawn">spawn</option>
+              <option value="env_set_light">light</option>
+              <option value="env_play_tone">tone</option>
+            </select>
+            <button class="btn o" id="btn-sched-add">+ ADD</button>
+          </div>
+          <div id="sched-env-list" class="sched-list"></div>
+        </div>
+
+      </div><!-- /env-ctrl-col -->
+    </div><!-- /env-strip -->
+  </div><!-- /panel8 -->
+
+</div><!-- /main -->
+
+<!-- ────────────────────────────────────────────────────────────────── -->
+<script type="importmap">
+{
+  "imports": {
+    "three":         "https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ═══════════════════════════════════════════════════════════
+// WebSocket
+// ═══════════════════════════════════════════════════════════
+const wsDot = document.getElementById('ws-dot');
+const wsLbl = document.getElementById('ws-lbl');
+const simTEl = document.getElementById('sim-t');
+let ws = null;
+let latestFrame = null;
+
+function wsConnect() {
+  ws = new WebSocket('ws://localhost:7734');
+  ws.onopen    = () => { wsDot.className = 'on'; wsLbl.textContent = 'CONNECTED'; };
+  ws.onclose   = () => { wsDot.className = ''; wsLbl.textContent = 'RECONNECTING…'; setTimeout(wsConnect, 2500); };
+  ws.onerror   = () => ws.close();
+  ws.onmessage = e  => { try { latestFrame = JSON.parse(e.data); } catch(_){} };
+}
+wsConnect();
+
+function send(msg) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); }
+
+// ═══════════════════════════════════════════════════════════
+// PANEL 1 — 3-D Brain  (Three.js)
+// ═══════════════════════════════════════════════════════════
+const brainCv = document.getElementById('brain-cv');
+const renderer = new THREE.WebGLRenderer({ canvas: brainCv, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setClearColor(0x04040c);
+
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+camera.position.set(0, 3, 13);
+
+const orbit = new OrbitControls(camera, brainCv);
+orbit.enableDamping = true;
+orbit.dampingFactor = 0.06;
+
+scene.add(new THREE.AmbientLight(0x202030, 1.5));
+const dLight = new THREE.DirectionalLight(0xffffff, 0.9);
+dLight.position.set(6, 10, 8);
+scene.add(dLight);
+
+// Instanced neurons
+const MAX_N = 1200;
+const nGeo  = new THREE.SphereGeometry(0.12, 7, 5);
+const nMat  = new THREE.MeshPhongMaterial({ shininess: 60 });
+const nMesh = new THREE.InstancedMesh(nGeo, nMat, MAX_N);
+nMesh.count = 0;
+nMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_N * 3), 3);
+scene.add(nMesh);
+
+// Synapse lines (max 200 segments)
+const MAX_S       = 200;
+const sPos        = new Float32Array(MAX_S * 6);
+const sCol        = new Float32Array(MAX_S * 6);
+const sGeo        = new THREE.BufferGeometry();
+sGeo.setAttribute('position', new THREE.BufferAttribute(sPos, 3));
+sGeo.setAttribute('color',    new THREE.BufferAttribute(sCol, 3));
+const sMat   = new THREE.LineBasicMaterial({ vertexColors: true });
+const sLines = new THREE.LineSegments(sGeo, sMat);
+sGeo.setDrawRange(0, 0);
+scene.add(sLines);
+
+const _dummy = new THREE.Object3D();
+const _c3    = new THREE.Color();
+
+const TYPE_RGB = {
+  AMPA: [1.0, 0.25, 0.25],
+  NMDA: [0.25, 0.25, 1.0],
+  GABA: [0.25, 0.75, 0.25],
+};
+
+let neuronPosCache = {};   // id → [x,y,z]
+
+function updateBrain(p1) {
+  const neurons  = p1.neurons  || [];
+  const synapses = p1.synapses || [];
+
+  document.getElementById('neuron-ct').textContent = `(${neurons.length})`;
+
+  nMesh.count = Math.min(neurons.length, MAX_N);
+  neuronPosCache = {};
+
+  for (let i = 0; i < nMesh.count; i++) {
+    const n   = neurons[i];
+    const pos = n.pos;
+    neuronPosCache[n.id] = pos;
+
+    _dummy.position.set(pos[0], pos[1], pos[2]);
+    const sp  = n.spike || 0;
+    const scl = n.background ? 0.55 + sp * 0.2 : 1.0 + sp * 2.2;
+    _dummy.scale.setScalar(scl);
+    _dummy.updateMatrix();
+    nMesh.setMatrixAt(i, _dummy.matrix);
+
+    const rgb = TYPE_RGB[n.type] || [0.5, 0.5, 0.55];
+    const dim = n.background ? 0.20 : 1.0;
+    _c3.setRGB(
+      (rgb[0] + sp * (1 - rgb[0])) * dim,
+      (rgb[1] + sp * (1 - rgb[1])) * dim,
+      (rgb[2] + sp * (1 - rgb[2])) * dim,
+    );
+    nMesh.setColorAt(i, _c3);
+  }
+  nMesh.instanceMatrix.needsUpdate = true;
+  nMesh.instanceColor.needsUpdate  = true;
+
+  // Synapses
+  const ns = Math.min(synapses.length, MAX_S);
+  let drawn = 0;
+  for (let i = 0; i < ns; i++) {
+    const s  = synapses[i];
+    const sp = neuronPosCache[s.from_id];
+    const dp = neuronPosCache[s.to_id];
+    if (!sp || !dp) continue;
+
+    const b  = drawn * 6;
+    sPos[b]   = sp[0]; sPos[b+1] = sp[1]; sPos[b+2] = sp[2];
+    sPos[b+3] = dp[0]; sPos[b+4] = dp[1]; sPos[b+5] = dp[2];
+
+    const rgb = TYPE_RGB[s.type] || [0.5, 0.5, 0.5];
+    const a   = s.pruned ? 0.08 : s.sprouting ? 0.9 : Math.min(1, s.weight * 2.5);
+    sCol[b]   = rgb[0]*a; sCol[b+1] = rgb[1]*a; sCol[b+2] = rgb[2]*a;
+    sCol[b+3] = rgb[0]*a; sCol[b+4] = rgb[1]*a; sCol[b+5] = rgb[2]*a;
+    drawn++;
+  }
+  sGeo.setDrawRange(0, drawn * 2);
+  sGeo.attributes.position.needsUpdate = true;
+  sGeo.attributes.color.needsUpdate    = true;
+}
+
+function resizeBrain() {
+  const p = brainCv.parentElement;
+  const w = p.clientWidth, h = p.clientHeight;
+  if (!w || !h) return;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+new ResizeObserver(resizeBrain).observe(brainCv.parentElement);
+resizeBrain();
+
+// ═══════════════════════════════════════════════════════════
+// Canvas utility
+// ═══════════════════════════════════════════════════════════
+function fitCv(cv) {
+  const p = cv.parentElement;
+  const w = p ? p.clientWidth : 200;
+  if (cv.width !== w) cv.width = w;
+}
+
+function drawLine(ctx, data, w, h, color, bg = '#08080e') {
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, w, h);
+  if (!data || data.length < 2) return;
+  const step = w / (data.length - 1);
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = 1.2;
+  ctx.beginPath();
+  for (let i = 0; i < data.length; i++) {
+    const x = i * step;
+    const y = h * 0.97 - data[i] * h * 0.94;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+// ═══════════════════════════════════════════════════════════
+// PANEL 2 — Vision
+// ═══════════════════════════════════════════════════════════
+const camImg  = document.getElementById('cam-img');
+const v1Cv    = document.getElementById('v1-cv');
+const itCv    = document.getElementById('it-cv');
+const achCv   = document.getElementById('ach-cv');
+const v1Ctx   = v1Cv.getContext('2d');
+const itCtx   = itCv.getContext('2d');
+const achCtx  = achCv.getContext('2d');
+
+function updateVision(p2) {
+  // Camera feed
+  if (p2.camera_feed_b64) {
+    camImg.src = 'data:image/png;base64,' + p2.camera_feed_b64;
+  }
+
+  // V1 orientation columns
+  fitCv(v1Cv);
+  const cols = p2.v1_columns || [];
+  const n    = cols.length;
+  if (n > 0) {
+    const cw = v1Cv.width / n, h = v1Cv.height;
+    v1Ctx.clearRect(0, 0, v1Cv.width, h);
+    for (let i = 0; i < n; i++) {
+      v1Ctx.fillStyle = cols[i].color || '#333';
+      const bri = 0.2 + (cols[i].rate || 0) * 0.8;
+      v1Ctx.globalAlpha = bri;
+      v1Ctx.fillRect(i * cw, 0, cw, h);
+    }
+    v1Ctx.globalAlpha = 1;
+  }
+
+  // IT heatmap — 24 bars
+  fitCv(itCv);
+  const it = p2.it_heatmap || [];
+  if (it.length > 0) {
+    const bw = itCv.width / it.length, ih = itCv.height;
+    itCtx.clearRect(0, 0, itCv.width, ih);
+    const mx = Math.max(...it, 0.001);
+    for (let i = 0; i < it.length; i++) {
+      const v   = it[i] / mx;
+      const hue = Math.round(i * 360 / it.length);
+      itCtx.fillStyle = `hsl(${hue},70%,${20 + v*50}%)`;
+      itCtx.fillRect(i * bw, ih * (1 - v), bw - 0.5, ih * v);
+    }
+  }
+
+  // ACh attention map — 8×8 heatmap
+  fitCv(achCv);
+  const ach = p2.ach_attention_map || [];
+  if (ach.length === 64) {
+    const cw = achCv.width / 8, ch = achCv.height / 8;
+    const mx = Math.max(...ach, 0.001);
+    for (let y = 0; y < 8; y++) {
+      for (let x = 0; x < 8; x++) {
+        const v = ach[y * 8 + x] / mx;
+        achCtx.fillStyle = `rgba(65,105,225,${(v * 0.9).toFixed(2)})`;
+        achCtx.fillRect(x * cw, y * ch, cw, ch);
+      }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// PANEL 3 — Auditory
+// ═══════════════════════════════════════════════════════════
+const waveCv  = document.getElementById('wave-cv');
+const melCv   = document.getElementById('mel-cv');
+const a1Cv    = document.getElementById('a1-cv');
+const waveCtx = waveCv.getContext('2d');
+const melCtx  = melCv.getContext('2d');
+const a1Ctx   = a1Cv.getContext('2d');
+const stgPh   = document.getElementById('stg-ph');
+const stgCf   = document.getElementById('stg-cf');
+
+function updateAudio(p3) {
+  // Waveform
+  fitCv(waveCv);
+  const wave = p3.waveform || [];
+  if (wave.length > 1) {
+    const w = waveCv.width, h = waveCv.height;
+    waveCtx.fillStyle = '#08080e';
+    waveCtx.fillRect(0, 0, w, h);
+    waveCtx.strokeStyle = '#4169e1';
+    waveCtx.lineWidth   = 1;
+    waveCtx.beginPath();
+    const step = w / (wave.length - 1);
+    for (let i = 0; i < wave.length; i++) {
+      const x = i * step, y = h / 2 - wave[i] * h * 0.45;
+      i === 0 ? waveCtx.moveTo(x, y) : waveCtx.lineTo(x, y);
+    }
+    waveCtx.stroke();
+  }
+
+  // Mel bands
+  fitCv(melCv);
+  const mel = p3.mel_bands || [];
+  if (mel.length > 0) {
+    const bw = melCv.width / mel.length, mh = melCv.height;
+    melCtx.clearRect(0, 0, melCv.width, mh);
+    const mx = Math.max(...mel, 0.001);
+    for (let i = 0; i < mel.length; i++) {
+      const v   = mel[i] / mx;
+      const hue = 240 - v * 200;
+      melCtx.fillStyle = `hsl(${hue},90%,${20 + v * 45}%)`;
+      melCtx.fillRect(i * bw, mh * (1 - v), bw, mh * v);
+    }
+  }
+
+  // A1 tonotopic
+  fitCv(a1Cv);
+  const a1   = p3.a1_activation || [];
+  const freq = p3.a1_pref_freq  || [];
+  if (a1.length > 0) {
+    const bw = a1Cv.width / a1.length, ah = a1Cv.height;
+    a1Ctx.fillStyle = '#08080e';
+    a1Ctx.fillRect(0, 0, a1Cv.width, ah);
+    const mx = Math.max(...a1, 0.001);
+    for (let i = 0; i < a1.length; i++) {
+      const v   = a1[i] / mx;
+      const hue = 180 + i * 10;
+      a1Ctx.fillStyle = `hsl(${hue},75%,${25 + v * 45}%)`;
+      a1Ctx.fillRect(i * bw, ah * (1 - v), bw - 0.5, ah * v);
+      if (freq[i] && i % 4 === 0) {
+        a1Ctx.fillStyle = '#404050';
+        a1Ctx.font = '7px monospace';
+        a1Ctx.fillText(freq[i] > 999 ? `${(freq[i]/1000).toFixed(1)}k` : `${Math.round(freq[i])}`, i * bw, ah - 1);
+      }
+    }
+  }
+
+  stgPh.textContent = p3.stg_label || '—';
+  stgCf.textContent = `confidence: ${(p3.stg_confidence || 0).toFixed(2)}`;
+}
+
+// ═══════════════════════════════════════════════════════════
+// PANEL 4 — Neurochemicals
+// ═══════════════════════════════════════════════════════════
+const CHEMS = ['dopamine','serotonin','cortisol','oxytocin','norepinephrine','acetylcholine'];
+const CSHORT = { dopamine:'DA', serotonin:'5HT', cortisol:'CORT', oxytocin:'OT', norepinephrine:'NE', acetylcholine:'ACh' };
+const CCOL   = { dopamine:'#4169e1', serotonin:'#3cb371', cortisol:'#ff6347', oxytocin:'#da70d6', norepinephrine:'#ff8c00', acetylcholine:'#4682b4' };
+
+const chemGrid = document.getElementById('chem-grid');
+const chemCvs  = {};
+const chemVals = {};
+
+CHEMS.forEach(c => {
+  const wrap = document.createElement('div');
+  wrap.className = 'chem-wrap';
+  const cv  = document.createElement('canvas');
+  cv.className = 'chem-cv';
+  cv.width = 200; cv.height = 44;
+  const nl  = document.createElement('div');
+  nl.className  = 'chem-name';
+  nl.style.color = CCOL[c];
+  nl.textContent = CSHORT[c];
+  const nv  = document.createElement('div');
+  nv.className  = 'chem-num';
+  nv.style.color = CCOL[c];
+  nv.textContent = '0.00';
+  wrap.append(cv, nl, nv);
+  chemGrid.appendChild(wrap);
+  chemCvs[c]  = { cv, ctx: cv.getContext('2d') };
+  chemVals[c] = nv;
+});
+
+const evLogEl = document.getElementById('evlog');
+
+function updateNeuro(p4) {
+  const cur  = p4.current || {};
+  const hist = p4.history || {};
+  CHEMS.forEach(c => {
+    const { cv, ctx } = chemCvs[c];
+    cv.width = cv.parentElement.clientWidth || 200;
+    drawLine(ctx, hist[c], cv.width, cv.height, CCOL[c]);
+    // Current value marker
+    const v = cur[c] || 0;
+    ctx.strokeStyle = CCOL[c] + '66';
+    ctx.lineWidth   = 0.5;
+    ctx.setLineDash([2, 5]);
+    const y = cv.height * 0.97 - v * cv.height * 0.94;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(cv.width, y); ctx.stroke();
+    ctx.setLineDash([]);
+    chemVals[c].textContent = v.toFixed(3);
+  });
+
+  const events = (p4.events || []).slice(-25).reverse();
+  evLogEl.innerHTML = '';
+  events.forEach(ev => {
+    const d   = document.createElement('div');
+    d.className = 'evrow';
+    const col = CCOL[ev.chemical] || '#606070';
+    d.innerHTML = `<b style="color:${col}">${CSHORT[ev.chemical] || ev.chemical}</b>`
+      + `<span style="color:#303048">${(ev.t_ms != null ? (ev.t_ms/1000).toFixed(1)+'s' : '')}</span> `
+      + `<span>${ev.trigger || ev.event || ''}</span>`;
+    evLogEl.appendChild(d);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════
+// PANEL 5 — Developmental Metrics
+// ═══════════════════════════════════════════════════════════
+const devBody = document.getElementById('dev-body');
+const STAGE_COL = ['#303048','#4169e1','#3cb371','#da70d6','#ff8c00'];
+
+function updateDev(p5) {
+  const s     = p5.stage || 0;
+  const sc    = STAGE_COL[s] || '#4169e1';
+  const conds = p5.stage_conditions || {};
+  const keys  = Object.keys(conds);
+
+  let condHtml = '';
+  if (keys.length) {
+    condHtml = `<div class="cond-grid">`;
+    keys.forEach(k => {
+      const ok  = conds[k];
+      const col = ok ? 'var(--green)' : 'var(--dim)';
+      condHtml += `<span class="cond-dot" style="background:${col}"></span>`
+        + `<span style="color:${col};font-size:9px">${k}</span>`;
+    });
+    condHtml += `</div>`;
+    condHtml += `<div class="mrow"><span class="ml">Exit conditions</span><span class="mv">${p5.conditions_met||0} / ${p5.conditions_total||0}</span></div>`;
+  }
+
+  devBody.innerHTML =
+    `<div style="text-align:center">
+       <span class="sbadge" style="color:${sc};border-color:${sc};background:${sc}1a">
+         STAGE ${s} — ${p5.stage_name || ''}
+       </span>
+     </div>`
+    + row('Age', p5.sim_age_human || '0s')
+    + row('Vocabulary', `${p5.vocabulary_size||0} words`)
+    + row('Synapses', `${p5.synapse_count||0}`)
+    + row('Created / Pruned', `+${p5.synapses_created_session||0} / -${p5.synapses_pruned_session||0}`)
+    + row('DMN corr.', (p5.dmn_correlation||0).toFixed(3) + (p5.dmn_active ? ' ●' : ''))
+    + row('PFC WM span', `${(p5.pfc_wm_span_ms||0).toFixed(0)} ms`)
+    + row('PFC myelination', (p5.pfc_myelination||0).toFixed(3))
+    + row('Self-model conf.', (p5.self_model_confidence||0).toFixed(3))
+    + row('Hippo episodes', p5.n_episodes||0)
+    + condHtml;
+}
+
+function row(label, val) {
+  return `<div class="mrow"><span class="ml">${label}</span><span class="mv">${val}</span></div>`;
+}
+
+// ═══════════════════════════════════════════════════════════
+// PANEL 6 — Internal State
+// ═══════════════════════════════════════════════════════════
+const intBody = document.getElementById('int-body');
+const EMO_COL = {
+  content:'#3cb371', curious:'#4169e1', anxious:'#ff6347', joyful:'#ffd700',
+  distressed:'#ff4040', calm:'#87ceeb', engaged:'#ff8c00', fatigued:'#606070',
+  bonded:'#da70d6', startled:'#ff2080',
+};
+const JOINT_NAMES = ['Spine','L.Shoulder','R.Shoulder','L.Elbow','R.Elbow','Leg.R'];
+
+function updateInternal(p6) {
+  const wm      = (p6.wm_contents || ['<empty>']).join('  |  ');
+  const emo     = p6.emotional_state || '—';
+  const econf   = p6.emotional_confidence || 0;
+  const ec      = EMO_COL[emo] || '#808090';
+  const mi      = p6.motor_intention || [0,0,0];
+  const ja      = p6.joint_angles    || [];
+
+  const jaHtml = JOINT_NAMES.map((nm, i) =>
+    `<span style="color:var(--dim)">${nm}:</span> ${(ja[i]||0).toFixed(2)}`
+  ).join('  ');
+
+  intBody.innerHTML =
+    `<div class="mrow"><span class="ml">WM contents</span><span class="mv" style="font-size:9px;color:var(--accent)">${wm}</span></div>`
+    + `<div style="padding:4px 7px;">
+         <span class="ebadge" style="color:${ec};border-color:${ec};background:${ec}15">
+           ${emo.toUpperCase()} <span style="color:var(--dim);font-size:8px">(${econf.toFixed(2)})</span>
+         </span>
+       </div>`
+    + `<div class="mrow"><span class="ml">Motor intention</span><span class="mv">[${mi.map(v=>v.toFixed(3)).join(', ')}]</span></div>`
+    + `<div style="padding:3px 7px 5px; font-size:9px; color:var(--dim); word-break:break-word">${jaHtml}</div>`;
+}
+
+// ═══════════════════════════════════════════════════════════
+// PANEL 7 — Mission Control
+// ═══════════════════════════════════════════════════════════
+const mcBody = document.getElementById('mc-body');
+let mcBuilt  = false;
+
+function buildMC() {
+  if (mcBuilt) return;
+  mcBuilt = true;
+
+  mcBody.innerHTML = `
+    <div class="ctrl-row">
+      <button class="btn g" id="btn-resume">▶ RESUME</button>
+      <button class="btn r" id="btn-pause">⏸ PAUSE</button>
+      <button class="btn r" id="btn-stop">■ STOP</button>
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-lbl">SPEED</span>
+      <input type="range" id="ts-slider" min="0.1" max="10" step="0.1" value="1" style="width:90px;">
+      <span id="ts-val" style="color:var(--accent)">1.0×</span>
+    </div>
+    <div class="ctrl-row">
+      <button class="btn o" id="btn-cort">CORT FLUSH</button>
+      <button class="btn o" id="btn-rest">FORCED REST</button>
+      <button class="btn r" id="btn-roll">STAGE ROLLBACK</button>
+    </div>
+    <div class="ctrl-row" style="flex-direction:column; align-items:flex-start; gap:2px;">
+      <span class="ctrl-lbl">MOTHER PENDING ACTION</span>
+      <div class="mpend" id="mpend">—</div>
+      <div style="display:flex; gap:4px;">
+        <button class="btn g" id="btn-appr">✓ APPROVE</button>
+        <button class="btn r" id="btn-deny">✗ DENY</button>
+      </div>
+    </div>
+    <div class="ctrl-row" style="flex-direction:column; align-items:flex-start; gap:2px;">
+      <span class="ctrl-lbl">SCHEDULED SESSIONS</span>
+      <div class="sched-list" id="sched-list"></div>
+    </div>
+  `;
+
+  document.getElementById('btn-resume').onclick = () => send({action:'resume'});
+  document.getElementById('btn-pause').onclick  = () => send({action:'pause'});
+  document.getElementById('btn-stop').onclick   = () => { if(confirm('Stop simulation?')) send({action:'stop'}); };
+  document.getElementById('btn-cort').onclick   = () => send({action:'cortisol_flush'});
+  document.getElementById('btn-rest').onclick   = () => send({action:'forced_rest', duration_s:300});
+  document.getElementById('btn-roll').onclick   = () => { if(confirm('Roll back stage?')) send({action:'stage_rollback'}); };
+  document.getElementById('btn-appr').onclick   = () => send({action:'mother_override', approve:true});
+  document.getElementById('btn-deny').onclick   = () => send({action:'mother_override', approve:false});
+
+  const tsSl = document.getElementById('ts-slider');
+  const tsVl = document.getElementById('ts-val');
+  tsSl.oninput = () => {
+    const v = parseFloat(tsSl.value);
+    tsVl.textContent = v.toFixed(1) + '×';
+    send({action:'set_time_scale', value:v});
+  };
+}
+
+function updateMC(p7) {
+  buildMC();
+
+  const pauseBtn  = document.getElementById('btn-pause');
+  const resumeBtn = document.getElementById('btn-resume');
+  if (pauseBtn && resumeBtn) {
+    pauseBtn.style.opacity  = p7.is_paused ? '0.35' : '1';
+    resumeBtn.style.opacity = p7.is_paused ? '1'    : '0.35';
+  }
+
+  const tsSl = document.getElementById('ts-slider');
+  const tsVl = document.getElementById('ts-val');
+  if (tsSl && p7.time_scale != null) {
+    tsSl.value = p7.time_scale;
+    tsVl.textContent = parseFloat(p7.time_scale).toFixed(1) + '×';
+  }
+
+  const mpEl = document.getElementById('mpend');
+  if (mpEl) mpEl.textContent = p7.mother_pending || '—';
+
+  const slEl = document.getElementById('sched-list');
+  if (slEl) {
+    const sess = p7.scheduled_sessions || [];
+    if (!sess.length) {
+      slEl.innerHTML = '<span style="color:var(--dim);font-size:9px">No sessions scheduled</span>';
+    } else {
+      slEl.innerHTML = sess.slice(0, 8).map(s =>
+        `<div class="sched-row">`
+        + `<span style="color:var(--accent)">${s.type||'?'}</span> `
+        + `<span>t=${(s.time_s||0).toFixed(0)}s</span> `
+        + (s.description ? `<span style="color:var(--dim)"> ${s.description}</span>` : '')
+        + `</div>`
+      ).join('');
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// PANEL 8 — Environment Observer  (Three.js 3-D viewport)
+// ═══════════════════════════════════════════════════════════
+const envObjs = document.getElementById('env-objs');
+const envCv   = document.getElementById('env-cv');
+
+// — Three.js scene for Panel 08 —
+const envRenderer = new THREE.WebGLRenderer({ canvas: envCv, antialias: true });
+envRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+envRenderer.setClearColor(0x000000);
+envRenderer.shadowMap.enabled = true;
+
+const envScene  = new THREE.Scene();
+const envCamera = new THREE.PerspectiveCamera(50, 1, 0.1, 500);
+envCamera.position.set(8, 6, -8);
+
+const envOrbit = new OrbitControls(envCamera, envCv);
+envOrbit.target.set(0, 0.5, 0);
+envOrbit.enableDamping   = true;
+envOrbit.dampingFactor   = 0.06;
+envOrbit.minDistance     = 2;
+envOrbit.maxDistance     = 40;
+envOrbit.maxPolarAngle   = Math.PI / 2 - 0.02;
+
+// Lights (updated each frame from panel8_env.light)
+const envAmbLight = new THREE.AmbientLight(0x8888ff, 0.08);
+const envDirLight = new THREE.DirectionalLight(0xaaaaff, 0.9);
+envDirLight.position.set(3, 10, 4);
+envDirLight.castShadow = true;
+envDirLight.shadow.mapSize.set(512, 512);
+envScene.add(envAmbLight, envDirLight);
+
+// Ground — dark floor tile
+const envGround = new THREE.Mesh(
+  new THREE.PlaneGeometry(40, 40),
+  new THREE.MeshLambertMaterial({ color: 0x06060e })
+);
+envGround.rotation.x   = -Math.PI / 2;
+envGround.receiveShadow = true;
+envScene.add(envGround);
+
+// Shared geometries (not disposed — reused across all objects)
+const _envSphGeo = new THREE.SphereGeometry(0.42, 24, 16);
+const _envBoxGeo = new THREE.BoxGeometry(0.80, 0.80, 0.80);
+
+// ─────────────────────────────────────────────────────────────────────
+// CAINE avatar — placeholder skeleton built from cylinders + sphere.
+// Posed each frame from avatar_pose data in the WebSocket payload.
+// ─────────────────────────────────────────────────────────────────────
+const _avMat  = new THREE.MeshPhongMaterial({ color: 0x2a3a4a, shininess: 40 });
+const _hatMat = new THREE.MeshPhongMaterial({ color: 0x100800, shininess: 8  });
+const _eyeMat = new THREE.MeshPhongMaterial({ color: 0x66bbff, shininess: 200, emissive: 0x112233 });
+
+function _cyl(rtop, rbot, h, seg) {
+  return new THREE.CylinderGeometry(rtop, rbot, h, seg || 10);
+}
+
+const caineAvatarGroup = new THREE.Group();
+
+// torso
+const _avTorso = new THREE.Mesh(_cyl(0.17, 0.14, 0.72), _avMat);
+_avTorso.position.set(0, 0.76, 0); _avTorso.castShadow = true;
+caineAvatarGroup.add(_avTorso);
+
+// neck
+const _avNeck = new THREE.Mesh(_cyl(0.07, 0.07, 0.12), _avMat);
+_avNeck.position.set(0, 1.22, 0);
+caineAvatarGroup.add(_avNeck);
+
+// head
+const _avHead = new THREE.Mesh(new THREE.SphereGeometry(0.17, 20, 14), _avMat);
+_avHead.position.set(0, 1.44, 0); _avHead.castShadow = true;
+caineAvatarGroup.add(_avHead);
+
+// hat brim
+const _avHatBrim = new THREE.Mesh(_cyl(0.27, 0.27, 0.03, 18), _hatMat);
+_avHatBrim.position.set(0, 1.61, 0);
+caineAvatarGroup.add(_avHatBrim);
+// hat crown
+const _avHatCrown = new THREE.Mesh(_cyl(0.15, 0.14, 0.20, 18), _hatMat);
+_avHatCrown.position.set(0, 1.72, 0);
+caineAvatarGroup.add(_avHatCrown);
+
+// eyes (left/right from CAINE's POV)
+const _avEyeL = new THREE.Mesh(new THREE.SphereGeometry(0.045, 10, 8), _eyeMat);
+const _avEyeR = new THREE.Mesh(new THREE.SphereGeometry(0.045, 10, 8), _eyeMat);
+_avEyeL.position.set(-0.075, 1.46, 0.155);
+_avEyeR.position.set( 0.075, 1.46, 0.155);
+caineAvatarGroup.add(_avEyeL, _avEyeR);
+
+// arms (shoulder → wrist angle)
+const _avArmL = new THREE.Mesh(_cyl(0.055, 0.040, 0.55), _avMat);
+const _avArmR = new THREE.Mesh(_cyl(0.055, 0.040, 0.55), _avMat);
+_avArmL.position.set(-0.29, 0.86, 0); _avArmL.rotation.z =  0.30; _avArmL.castShadow = true;
+_avArmR.position.set( 0.29, 0.86, 0); _avArmR.rotation.z = -0.30; _avArmR.castShadow = true;
+caineAvatarGroup.add(_avArmL, _avArmR);
+
+// legs
+const _avLegL = new THREE.Mesh(_cyl(0.082, 0.065, 0.70), _avMat);
+const _avLegR = new THREE.Mesh(_cyl(0.082, 0.065, 0.70), _avMat);
+_avLegL.position.set(-0.115, 0.35, 0); _avLegL.castShadow = true;
+_avLegR.position.set( 0.115, 0.35, 0); _avLegR.castShadow = true;
+caineAvatarGroup.add(_avLegL, _avLegR);
+
+envScene.add(caineAvatarGroup);
+
+// Live mesh pool: uid → THREE.Mesh
+const envMeshPool = {};
+
+function _resizeEnvCv() {
+  const col = document.getElementById('env-cam-col');
+  const w   = col ? col.clientWidth  : 400;
+  const h   = Math.max(60, (col ? col.clientHeight : 220) - (envObjs.offsetHeight || 52));
+  envRenderer.setSize(w, h);
+  envCamera.aspect = w / h;
+  envCamera.updateProjectionMatrix();
+}
+new ResizeObserver(_resizeEnvCv).observe(document.getElementById('env-cam-col'));
+_resizeEnvCv();
+
+// — Controls (spawn / light / tone / schedule) —
+let envBuilt      = false;
+let schedEnvItems = [];
+
+function buildEnvControls() {
+  if (envBuilt) return;
+  envBuilt = true;
+
+  document.getElementById('btn-spawn').onclick = () => {
+    send({ action: 'env_spawn', id: 'obj_' + Date.now(),
+      pos: [parseFloat(document.getElementById('spawn-x').value)||0,
+            parseFloat(document.getElementById('spawn-y').value)||1,
+            parseFloat(document.getElementById('spawn-z').value)||2],
+      object_type: document.getElementById('spawn-type').value });
+  };
+
+  document.getElementById('btn-light').onclick = () => {
+    const hex = document.getElementById('light-col').value;
+    send({ action: 'env_set_light',
+      color: [parseInt(hex.slice(1,3),16)/255, parseInt(hex.slice(3,5),16)/255, parseInt(hex.slice(5,7),16)/255],
+      intensity: parseFloat(document.getElementById('light-int').value) });
+  };
+
+  document.getElementById('light-int').oninput = () => {
+    document.getElementById('light-int-val').textContent =
+      parseFloat(document.getElementById('light-int').value).toFixed(2);
+  };
+
+  document.getElementById('btn-tone').onclick = () => {
+    send({ action: 'env_play_tone',
+      frequency: parseFloat(document.getElementById('tone-hz').value)  || 440,
+      duration:  parseFloat(document.getElementById('tone-dur').value) || 0.5,
+      volume:    parseFloat(document.getElementById('tone-vol').value) || 0.5 });
+  };
+
+  document.getElementById('btn-sched-add').onclick = () => {
+    const at_sim_s = parseFloat(document.getElementById('sched-t').value) || 0;
+    const act      = document.getElementById('sched-act').value;
+    const ev       = { action: act };
+    if (act === 'env_spawn') {
+      ev.id = 'sched_' + Date.now();
+      ev.pos = [parseFloat(document.getElementById('spawn-x').value)||0,
+                parseFloat(document.getElementById('spawn-y').value)||1,
+                parseFloat(document.getElementById('spawn-z').value)||2];
+      ev.object_type = document.getElementById('spawn-type').value;
+    } else if (act === 'env_set_light') {
+      const hex = document.getElementById('light-col').value;
+      ev.color = [parseInt(hex.slice(1,3),16)/255, parseInt(hex.slice(3,5),16)/255, parseInt(hex.slice(5,7),16)/255];
+      ev.intensity = parseFloat(document.getElementById('light-int').value);
+    } else if (act === 'env_play_tone') {
+      ev.frequency = parseFloat(document.getElementById('tone-hz').value) || 440;
+      ev.duration  = parseFloat(document.getElementById('tone-dur').value) || 0.5;
+      ev.volume    = parseFloat(document.getElementById('tone-vol').value) || 0.5;
+    }
+    send({ action: 'env_schedule_event', at_sim_s, event: ev });
+    schedEnvItems.push({ at_sim_s, label: act.replace('env_','') });
+    _renderSchedEnv();
+  };
+}
+
+function _renderSchedEnv() {
+  const el = document.getElementById('sched-env-list');
+  if (!el) return;
+  el.innerHTML = schedEnvItems.length
+    ? schedEnvItems.slice(-6).reverse().map(s =>
+        `<div class="sched-row"><span style="color:var(--orange)">${s.label}</span> @ t=${s.at_sim_s.toFixed(0)}s</div>`
+      ).join('')
+    : '<span style="color:var(--dim);font-size:8px">no events scheduled</span>';
+}
+
+function updateEnv(p8) {
+  buildEnvControls();
+
+  // Sync lights
+  const lt = p8.light || {};
+  if (lt.color)       envDirLight.color.setRGB(...lt.color);
+  if (lt.ambient != null) envAmbLight.intensity = Math.max(0.03, lt.ambient);
+  if (lt.dir)         envDirLight.position.set(...lt.dir).normalize().multiplyScalar(15);
+
+  // Sync 3D objects — add/update/remove
+  const seen = new Set();
+  for (const o of (p8.objects || [])) {
+    seen.add(o.id);
+    if (!envMeshPool[o.id]) {
+      const mat  = new THREE.MeshPhongMaterial({ shininess: 90 });
+      const mesh = new THREE.Mesh(o.type === 'sphere' ? _envSphGeo : _envBoxGeo, mat);
+      mesh.castShadow = mesh.receiveShadow = true;
+      envScene.add(mesh);
+      envMeshPool[o.id] = mesh;
+    }
+    envMeshPool[o.id].position.set(...o.pos);
+    envMeshPool[o.id].material.color.setRGB(...o.color);
+  }
+  for (const uid of Object.keys(envMeshPool)) {
+    if (!seen.has(uid)) {
+      envScene.remove(envMeshPool[uid]);
+      envMeshPool[uid].material.dispose();
+      delete envMeshPool[uid];
+    }
+  }
+
+  // Objects list (sidebar)
+  const objs = p8.objects || [];
+  envObjs.innerHTML = objs.length
+    ? objs.map(o =>
+        `<div class="env-obj-row">`
+        + `<span style="color:var(--accent);flex:0 0 auto">${o.id}</span>`
+        + `<span style="color:var(--dim);flex:0 0 auto">${o.type}</span>`
+        + `<span style="flex:1">[${o.pos.map(v=>v.toFixed(1)).join(', ')}]</span>`
+        + `<button class="btn r" style="padding:1px 4px;font-size:8px;flex:0 0 auto"`
+        + ` onclick="send({action:'env_remove',id:'${o.id}'})">✕</button>`
+        + `</div>`
+      ).join('')
+    : '<span style="color:var(--dim)">no objects in scene</span>';
+
+  // ── CAINE avatar position + pose ──────────────────────────────
+  if (p8.caine_pos) {
+    caineAvatarGroup.position.set(p8.caine_pos[0], 0, p8.caine_pos[2]);
+  }
+  const pose = p8.avatar_pose || {};
+  // spine curl — lean torso forward
+  _avTorso.rotation.x = (pose.spine_curl  || 0) * 0.45;
+  // head tilt (side-to-side)
+  _avHead.rotation.z  = (pose.head_tilt   || 0) * 0.35;
+  // hat follows head tilt
+  const htilt = (pose.hat_tilt || 0) * 0.55;
+  _avHatBrim.rotation.z  = htilt;
+  _avHatCrown.rotation.z = htilt;
+  // gaze direction → yaw head + eyes
+  const gz   = pose.gaze || [0, 0, 1];
+  const gyaw = Math.atan2(gz[0], gz[2]);
+  _avHead.rotation.y  = gyaw * 0.65;
+  _avEyeL.rotation.y  = gyaw * 0.65;
+  _avEyeR.rotation.y  = gyaw * 0.65;
+  // eye blink (scale Y)
+  const ew = Math.max(0.05, Math.min(1.0, pose.eye_width != null ? pose.eye_width : 1.0));
+  _avEyeL.scale.y = ew; _avEyeR.scale.y = ew;
+
+  const badge = document.getElementById('env-stage-badge');
+  if (badge) badge.textContent = `· stage ${p8.stage ?? '?'}`;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Main render / update loop
+// ═══════════════════════════════════════════════════════════
+function loop() {
+  requestAnimationFrame(loop);
+  orbit.update();
+  renderer.render(scene, camera);
+  envOrbit.update();
+  envRenderer.render(envScene, envCamera);
+
+  if (!latestFrame) return;
+  const f = latestFrame;
+  latestFrame = null;
+
+  simTEl.textContent = `t = ${(f.t || 0).toFixed(3)} s`;
+
+  if (f.panel1_brain)    updateBrain(f.panel1_brain);
+  if (f.panel2_vision)   updateVision(f.panel2_vision);
+  if (f.panel3_auditory) updateAudio(f.panel3_auditory);
+  if (f.panel4_neuro)    updateNeuro(f.panel4_neuro);
+  if (f.panel5_dev)      updateDev(f.panel5_dev);
+  if (f.panel6_internal) updateInternal(f.panel6_internal);
+  if (f.panel7_controls) updateMC(f.panel7_controls);
+  if (f.panel8_env)      updateEnv(f.panel8_env);
+}
+loop();
+
+// ═══════════════════════════════════════════════════════════
+// Resizable panels
+// ═══════════════════════════════════════════════════════════
+function setupColDivider(divEl, colA, colB) {
+  divEl.addEventListener('mousedown', e => {
+    e.preventDefault();
+    divEl.classList.add('drag');
+    const startX  = e.clientX;
+    const startA  = colA.offsetWidth;
+    const startB  = colB.offsetWidth;
+    const onMove  = ev => {
+      const dx   = ev.clientX - startX;
+      const newA = Math.max(80, startA + dx);
+      const newB = Math.max(80, startB - dx);
+      colA.style.flex = `0 0 ${newA}px`;
+      colB.style.flex = `0 0 ${newB}px`;
+    };
+    const onUp = () => {
+      divEl.classList.remove('drag');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup',   onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup',   onUp);
+  });
+}
+
+function setupRowDivider(divEl, panel) {
+  divEl.addEventListener('mousedown', e => {
+    e.preventDefault();
+    divEl.classList.add('drag');
+    const startY = e.clientY;
+    const startH = panel.offsetHeight;
+    const onMove = ev => {
+      const dy   = ev.clientY - startY;
+      const newH = Math.max(80, startH - dy);
+      panel.style.flex = `0 0 ${newH}px`;
+    };
+    const onUp = () => {
+      divEl.classList.remove('drag');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup',   onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup',   onUp);
+  });
+}
+
+setupColDivider(
+  document.getElementById('col-div-1'),
+  document.getElementById('col-brain'),
+  document.getElementById('col-center'),
+);
+setupColDivider(
+  document.getElementById('col-div-2'),
+  document.getElementById('col-center'),
+  document.getElementById('col-right'),
+);
+setupRowDivider(
+  document.getElementById('row-div'),
+  document.getElementById('panel8'),
+);
+
+
+// ═══════════════════════════════════════════════════════════
+// Global resize
+// ═══════════════════════════════════════════════════════════
+window.addEventListener('resize', () => {
+  resizeBrain();
+  _resizeEnvCv();
+  [waveCv, melCv, a1Cv].forEach(cv => {
+    if (cv.parentElement) cv.width = cv.parentElement.clientWidth || 200;
+  });
+});
+setTimeout(() => {
+  [waveCv, melCv, a1Cv, v1Cv, itCv, achCv].forEach(cv => {
+    if (cv.parentElement) cv.width = cv.parentElement.clientWidth || 200;
+  });
+}, 300);
+
+</script>
+</body>
+</html>
