@@ -1,0 +1,47 @@
+{
+  "name": "caine-mission-control",
+  "version": "1.0.0",
+  "description": "CAINE Mission Control — Visualization Dashboard",
+  "main": "main.js",
+  "scripts": {
+    "start":    "electron .",
+    "dev":      "cross-env NODE_ENV=development electron .",
+    "build":    "electron-builder --win portable",
+    "build:installer": "electron-builder --win nsis"
+  },
+  "build": {
+    "appId": "com.hackerbbrine.caine",
+    "productName": "CAINE Mission Control",
+    "directories": {
+      "output": "../dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html"
+    ],
+    "win": {
+      "target": [
+        { "target": "portable", "arch": ["x64"] },
+        { "target": "nsis",     "arch": ["x64"] }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "portable": {
+      "artifactName": "CAINE-MissionControl-portable.exe"
+    }
+  },
+  "devDependencies": {
+    "cross-env":        "^7.0.3",
+    "electron":         "^28.3.3",
+    "electron-builder": "^24.13.3"
+  }
+}

@@ -70,18 +70,20 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Module imports
 # ---------------------------------------------------------------------------
-from caine.cortex    import V1Population, A1Population
+from caine.cortex    import (V1Population, A1Population,
+                              V2Population, V4Population, MTPopulation,
+                              ITPopulation, A2Population, STGPopulation,
+                              PFCPopulation, AngularGyrusPopulation, DMNMonitor)
 from caine.chemicals import NeurochemicalSystem, NeurochemicalEvent, EventType
 from caine.sensory   import SensoryLayer, S1Population, SAMPLE_RATE, FRAME_SAMPLES
 from caine.limbic    import LimbicSystem
 from caine.motor     import MotorCortex, MotorPopulation, I_BASE_M1, _COLUMNS, FINGER_NAMES
 from caine.environment import CaineEnvironment
 from caine.parenting import ParentingSystem
+import caine.paths as _paths
 
-_OUTPUT_DIR = os.path.normpath(os.path.join(_PROJECT_ROOT, 'output'))
-_DATA_DIR   = os.path.normpath(os.path.join(_PROJECT_ROOT, 'data'))
-os.makedirs(_OUTPUT_DIR, exist_ok=True)
-os.makedirs(_DATA_DIR,   exist_ok=True)
+_OUTPUT_DIR = _paths.OUTPUT_DIR
+_DATA_DIR   = _paths.DATA_DIR
 
 log = logging.getLogger('caine.main')
 if not log.handlers:
@@ -191,7 +193,7 @@ class NeurogenesisTracker:
         self._m1_satellites: List[MotorPopulation] = []
         self._satellite_idle: List[int]            = []   # ticks since last spike
 
-        self._log_file = os.path.join(_OUTPUT_DIR, 'neurogenesis_log.jsonl')
+        self._log_file = _paths.NEUROGENESIS_LOG
         self._alpha    = 0.05   # EMA decay (smoothing)
 
     # ------------------------------------------------------------------
@@ -369,7 +371,7 @@ class StageManager:
         self._last_check_sim_s: float = 0.0
         self._father_seen: bool = False
         self._consciousness_events: int = 0
-        self._milestones_file = os.path.join(_OUTPUT_DIR, 'milestones.jsonl')
+        self._milestones_file = _paths.MILESTONES_LOG
 
     # ------------------------------------------------------------------
     def update(self,
@@ -652,9 +654,9 @@ class BrainStateCheckpoint:
     """
 
     def __init__(self):
-        self._h5_path  = os.path.join(_OUTPUT_DIR, 'checkpoint.h5')
-        self._npz_path = os.path.join(_OUTPUT_DIR, 'checkpoint.npz')
-        self._meta_path = os.path.join(_OUTPUT_DIR, 'checkpoint_meta.json')
+        self._h5_path   = _paths.CHECKPOINT_H5
+        self._npz_path  = _paths.CHECKPOINT_NPZ
+        self._meta_path = _paths.CHECKPOINT_META
 
     # ------------------------------------------------------------------
     def save(self,
@@ -805,6 +807,17 @@ class CAINEBrain:
         self.v1    = V1Population(n_neurons=20)
         self.a1    = A1Population(n_neurons=20)
 
+        # ---- Higher cortical association areas ---------------------------
+        self.v2    = V2Population()
+        self.v4    = V4Population()
+        self.mt    = MTPopulation()
+        self.it    = ITPopulation()
+        self.a2    = A2Population()
+        self.stg   = STGPopulation()
+        self.pfc   = PFCPopulation(stage=0)
+        self.ag    = AngularGyrusPopulation()
+        self.dmn   = DMNMonitor(self.pfc, self.ag, dt_ms=frame_ms)
+
         # ---- Neurochemical system ----------------------------------------
         self.neuro = NeurochemicalSystem()
 
@@ -820,7 +833,7 @@ class CAINEBrain:
         # ---- Motor cortex ------------------------------------------------
         self.motor = MotorCortex(
             self.s1, self.neuro,
-            body_map_file=os.path.join(_OUTPUT_DIR, 'body_map.json'),
+            body_map_file=_paths.BODY_MAP_FILE,
             rng_seed=rng_seed,
         )
 
@@ -935,6 +948,8 @@ class CAINEBrain:
         # =================================================================
         # STEP 1 — Environment step + camera feed
         # =================================================================
+        self.env.set_stage(self.stage_mgr.stage)
+        self.env.advance_sim_time(dt / 1000.0 * self.parenting._time_multiplier)   # dt in ms → seconds, speed-scaled
         self.env.step()
         frame_rgb = self.env.get_camera_feed()
 
@@ -944,11 +959,17 @@ class CAINEBrain:
         # =================================================================
         joint_angles = self.motor.joint_angles   # current actual joint angles
 
+        # Pull any queued clip frames from the parenting system
+        clip_audio = self.parenting.pop_injected_audio()   # float32 or None
+        clip_frame = self.parenting.pop_injected_frame()   # uint8 (64,64,3) or None
+        if clip_frame is not None:
+            frame_rgb = clip_frame   # override camera feed with video clip frame
+
         sense_result = self.sense.update(
             frame_rgb,
             joint_angles,
             dt_ms=dt,
-            injected_audio=None,   # mic handled inside SensoryLayer
+            injected_audio=clip_audio,   # None → mic/fallback used internally
         )
         self._sense_result = sense_result
 
@@ -976,6 +997,78 @@ class CAINEBrain:
         if limbic_result.get('neuro_events'):
             self.neuro.update(0.0, events=limbic_result['neuro_events'])
             neuro_snap = self.neuro.snapshot()
+
+        # =================================================================
+        # STEP 4b — Higher cortical association areas
+        # V2/V4/MT/IT (visual hierarchy), A2/STG (auditory), PFC, AG, DMN
+        # =================================================================
+        gain_mod = self.neuro.global_gain()
+        stdp_s   = self.neuro.stdp_scale()
+        t_ms     = self.sim_time_s * 1000.0
+
+        # Visual hierarchy: V2 → V4 → MT → IT
+        I_v2 = self.v2.compute_drive(self.v1.rate_est, gain_mod=gain_mod)
+        self.v2.step(dt, I_v2)
+        v2_fired = self.v2.detect_spikes(t_ms)
+        self.v2.update_rate_est(v2_fired, dt)
+
+        # V4 needs mean RGB — extract from frame or use neutral grey
+        rgb_mean = None
+        if frame_rgb is not None and frame_rgb.size > 0:
+            rgb_mean = frame_rgb.reshape(-1, 3).mean(axis=0) / 255.0
+        I_v4 = self.v4.compute_drive(rgb_mean=rgb_mean, v2_rates=self.v2.rate_est, gain_mod=gain_mod)
+        self.v4.step(dt, I_v4)
+        v4_fired = self.v4.detect_spikes(t_ms)
+        self.v4.update_rate_est(v4_fired, dt)
+
+        I_mt = self.mt.compute_drive(self.v1.rate_est, gain_mod=gain_mod)
+        self.mt.step(dt, I_mt)
+        mt_fired = self.mt.detect_spikes(t_ms)
+        self.mt.update_rate_est(mt_fired, dt)
+
+        I_it = self.it.compute_drive(
+            np.concatenate([self.v2.rate_est, self.v4.rate_est, self.mt.rate_est]),
+            gain_mod=gain_mod)
+        self.it.step(dt, I_it)
+        it_fired = self.it.detect_spikes(t_ms)
+        self.it.update_rate_est(it_fired, dt)
+        self.it.hebbian_update(self.it.rate_est,
+                               np.concatenate([self.v2.rate_est,
+                                               self.v4.rate_est,
+                                               self.mt.rate_est]))
+
+        # Auditory hierarchy: A2 → STG
+        I_a2 = self.a2.compute_drive(self.a1.rate_est, gain_mod=gain_mod)
+        self.a2.step(dt, I_a2)
+        a2_fired = self.a2.detect_spikes(t_ms)
+        self.a2.update_rate_est(a2_fired, dt)
+
+        I_stg = self.stg.compute_drive(self.a2.rate_est, gain_mod=gain_mod)
+        self.stg.step(dt, I_stg)
+        stg_fired = self.stg.detect_spikes(t_ms)
+        self.stg.update_rate_est(stg_fired, dt)
+        self.stg.stdp_update(stg_fired, t_ms, self.a2.rate_est, neuro_scale=stdp_s)
+
+        # PFC: gated by developmental stage (property uses self.pfc.stage)
+        self.pfc.stage = self.stage_mgr.stage
+        I_pfc = self.pfc.compute_drive(gain_mod=gain_mod)
+        self.pfc.step(dt, I_pfc)
+        pfc_fired = self.pfc.detect_spikes(t_ms)
+        self.pfc.update_rate_est(pfc_fired, dt)
+        self.pfc.update_wm(pfc_fired, dt)
+
+        # Angular Gyrus (cross-modal binding)
+        I_ag = self.ag.compute_drive(stg_rates=self.stg.rate_est,
+                                     mpfc_rates=self.pfc.mPFC_rates,
+                                     gain_mod=gain_mod)
+        self.ag.step(dt, I_ag)
+        ag_fired = self.ag.detect_spikes(t_ms)
+        self.ag.update_rate_est(ag_fired, dt)
+        self.ag.update_trace(ag_fired, dt)
+
+        # DMN: active during low-stimulation rest
+        is_resting = (v1_spikes.sum() == 0) and (a1_spikes.sum() == 0)
+        dmn_active = self.dmn.update(t_ms, is_resting=is_resting)
 
         # =================================================================
         # STEP 5 — Motor cortex
@@ -1119,19 +1212,20 @@ class CAINEBrain:
         n_syn  = result.get('synapse_estimate', 0)
         da     = snap.get('dopamine',       0.10)
         cort   = snap.get('cortisol',       0.08)
-        father = result.get('father_presence', 'FATHER_ABSENT')
+        father      = result.get('father_presence', 'FATHER_ABSENT')
+        exposure_pct = result.get('father_exposure_pct', 0.0)
         vocab  = result.get('vocabulary_size', 0)
-        mscore = result.get('motor_motor_learning_score',
-                            result.get('motor_learning_score', 0.0))
-        # motor_result keys are prefixed 'motor_' in combined dict
         mscore = result.get('motor_motor_learning_score', 0.0)
 
         # DMN proxy from ACC activity
         acc_spikes = result.get('limbic_acc_spikes', np.zeros(20))
         dmn = float(np.asarray(acc_spikes).astype(float).mean())
 
-        # Short father label
-        fa_label = father.replace('FATHER_', '')
+        # Father label: show learning progress until neurons know who he is
+        if exposure_pct < 100.0:
+            fa_label = f"LEARNING({exposure_pct:.0f}%)"
+        else:
+            fa_label = father.replace('FATHER_', '')
 
         return (
             f"[CAINE] age={age_h:.2f}h  stage={stage}"

@@ -21,3 +21,19 @@ output/viz_test.png
 output/wav_zoom.png
 output/voiceprint_demo.json
 data/
+
+# Node / Electron
+ui/node_modules/
+ui/dist/
+dist/
+
+# Output runtime artifacts
+output/logs/
+output/saves/
+output/viz/
+output/uploads/
+output/dev_report_*.json
+output/milestones.jsonl
+output/*.png
+output/*.json
+output/_blender_bridge.py
